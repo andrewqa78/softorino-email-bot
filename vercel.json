@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/process_email.py": {
+      "runtime": "python3.11"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/process_email",
+      "dest": "/api/process_email.py"
+    }
+  ]
+}
