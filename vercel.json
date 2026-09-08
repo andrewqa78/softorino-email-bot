@@ -1,13 +1,3 @@
 {
-  "functions": {
-    "api/process_email.py": {
-      "runtime": "python3.12"
-    }
-  },
-  "routes": [
-    {
-      "src": "/api/process_email",
-      "dest": "/api/process_email.py"
-    }
-  ]
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }
