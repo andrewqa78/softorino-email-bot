@@ -168,6 +168,44 @@ Knowledge base:
     return reply
 
 
+def escalate_email(service, sender, subject, email_content, reason):
+    escalation_email = os.getenv("ESCALATION_EMAIL_1")
+    if not escalation_email:
+        raise RuntimeError("Missing environment variable: ESCALATION_EMAIL_1")
+
+    escalation_body = f"""[ESCALATION NOTIFICATION]
+
+Customer Email: {sender}
+Subject: {subject}
+Reason: {reason}
+
+--- Original Message ---
+{email_content}
+
+--- End of Original Message ---
+
+This ticket requires manual attention from the support team.
+"""
+
+    escalation_msg = EmailMessage()
+    escalation_msg["To"] = escalation_email
+    escalation_msg["From"] = os.getenv("GMAIL_USER_EMAIL", "support@softorino.app")
+    escalation_msg["Subject"] = f"[ESCALATION] {subject} — {sender}"
+    escalation_msg.set_content(escalation_body)
+
+    encoded_escalation = base64.urlsafe_b64encode(escalation_msg.as_bytes()).decode()
+    service.users().messages().send(
+        userId="me",
+        body={"raw": encoded_escalation},
+    ).execute()
+
+    return {
+        "escalated": True,
+        "recipient": escalation_email,
+        "reason": reason,
+    }
+
+
 def process_first_unread_email():
     if os.getenv("DRY_RUN", "true").lower() != "true":
         raise RuntimeError("DRY_RUN must be true while draft-only testing is enabled.")
