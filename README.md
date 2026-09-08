@@ -44,10 +44,22 @@ softorino-email-bot/
 └── README.md
 ```
 
-Implementation setup will be added in the next steps:
+The current POST endpoint processes one unread inbox email:
 
-1. Gmail API OAuth integration
-2. GitHub knowledge base fetching
-3. Claude API reply generation
-4. Gmail reply and read-status handling
-5. Vercel deployment configuration
+1. Finds the first unread message in the inbox.
+2. Creates a reply draft with `Test draft from Softorino Bot`.
+3. Marks the source message as read.
+4. Returns the email subject and Gmail draft ID as JSON.
+
+Send a `POST` request to `/api/process_email` to run the test flow. A `GET`
+request only checks that the function is available and does not expose the
+configured mailbox address.
+
+Required Vercel environment variables:
+
+```text
+GMAIL_USER_EMAIL
+GMAIL_CLIENT_ID
+GMAIL_CLIENT_SECRET
+GMAIL_REFRESH_TOKEN
+```
