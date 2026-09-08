@@ -3,9 +3,14 @@
 import base64
 import json
 import os
+import re
 from email.message import EmailMessage
+from email.utils import parseaddr
 from http.server import BaseHTTPRequestHandler
+from html.parser import HTMLParser
+from urllib.request import Request as UrlRequest, urlopen
 
+import anthropic
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -16,7 +21,24 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.send",
 ]
-TEST_DRAFT_TEXT = "Test draft from Softorino Bot"
+KB_BASE_URL = (
+    "https://raw.githubusercontent.com/andrewqa78/Softorino_Support_AI/main/"
+    "knowledge_base/"
+)
+CLAUDE_MODEL = "claude-sonnet-4-6"
+MAX_EMAIL_CHARS = 30000
+
+
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self):
+        return " ".join(" ".join(self.parts).split())
 
 
 def gmail_service():
@@ -47,7 +69,108 @@ def header_value(headers, name):
     return ""
 
 
+def decode_part_body(part):
+    body = part.get("body", {}).get("data")
+    if not body:
+        return ""
+    decoded = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+    return decoded.decode("utf-8", errors="replace")
+
+
+def message_text(payload):
+    plain_parts = []
+    html_parts = []
+
+    def collect(part):
+        mime_type = part.get("mimeType", "")
+        if part.get("filename"):
+            return
+        if mime_type == "text/plain":
+            plain_parts.append(decode_part_body(part))
+        elif mime_type == "text/html":
+            html_parts.append(decode_part_body(part))
+        for child in part.get("parts", []):
+            collect(child)
+
+    collect(payload)
+    text = "\n".join(part for part in plain_parts if part.strip()).strip()
+    if not text and html_parts:
+        extractor = TextExtractor()
+        extractor.feed("\n".join(html_parts))
+        text = extractor.text()
+    return text.strip()
+
+
+def fetch_kb_file(filename):
+    request = UrlRequest(KB_BASE_URL + filename, headers={"User-Agent": "Softorino-Email-Bot"})
+    with urlopen(request, timeout=10) as response:
+        return response.read().decode("utf-8")
+
+
+def relevant_kb_files(email_content):
+    content = email_content.lower()
+    files = ["active_product_issues.md", "global_rules.md"]
+    routing = {
+        "waltr_pro.md": ("waltr", "waltr pro"),
+        "syc_pro.md": ("syc", "youtube converter"),
+        "alttunes.md": ("alttunes",),
+        "iringg.md": ("iringg",),
+        "activation_and_license.md": ("activation", "license", "subscription", "dashboard"),
+        "Softorino_Billing_and_Payments.md": ("refund", "charge", "billing", "payment", "cancel"),
+        "other_products.md": ("beamer", "folder colorizer", "picfindr", "cleanappsnow"),
+    }
+    for filename, keywords in routing.items():
+        if any(re.search(rf"\b{re.escape(keyword)}\b", content) for keyword in keywords):
+            files.append(filename)
+    if len(files) == 2:
+        files.append("Softorino_Products.md")
+    return files
+
+
+def build_knowledge_base(email_content):
+    files = relevant_kb_files(email_content)
+    sections = []
+    for filename in files:
+        sections.append(f"\n--- {filename} ---\n{fetch_kb_file(filename)}")
+    return "".join(sections), files
+
+
+def generate_reply(email_content, subject, knowledge_base):
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing environment variable: ANTHROPIC_API_KEY")
+    client = anthropic.Anthropic(api_key=api_key)
+    system_prompt = f"""You are a Softorino customer support agent named Sofi.
+Reply in English using ONLY the knowledge base provided below.
+Be friendly and concise. Never mention that you are an AI.
+Never promise ETAs or refunds. Never offer remote sessions.
+Sign off exactly as: Best regards, Softorino Support Team
+If the knowledge base does not contain a reliable answer, reply exactly:
+Thank you for reaching out. Our support team will review your case and get back to you shortly. We appreciate your patience. Best regards, Softorino Support Team
+
+Knowledge base:
+{knowledge_base}
+"""
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=1200,
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Customer email subject: {subject}\n\nCustomer email:\n{email_content}",
+            }
+        ],
+    )
+    reply = "".join(block.text for block in response.content if block.type == "text").strip()
+    if not reply:
+        raise RuntimeError("Claude returned an empty reply.")
+    return reply
+
+
 def process_first_unread_email():
+    if os.getenv("DRY_RUN", "true").lower() != "true":
+        raise RuntimeError("DRY_RUN must be true while draft-only testing is enabled.")
     service = gmail_service()
     result = (
         service.users()
@@ -66,7 +189,7 @@ def process_first_unread_email():
     message = (
         service.users()
         .messages()
-        .get(userId="me", id=messages[0]["id"], format="metadata")
+        .get(userId="me", id=messages[0]["id"], format="full")
         .execute()
     )
     headers = message.get("payload", {}).get("headers", [])
@@ -74,16 +197,22 @@ def process_first_unread_email():
     subject = header_value(headers, "Subject") or "(no subject)"
     message_id = header_value(headers, "Message-ID")
     references = header_value(headers, "References")
+    email_content = message_text(message.get("payload", {}))[:MAX_EMAIL_CHARS]
     if not sender:
         raise RuntimeError("Unread email does not contain a sender address.")
+    if not email_content:
+        raise RuntimeError("Unread email does not contain readable text.")
+
+    knowledge_base, kb_files = build_knowledge_base(email_content)
+    reply = generate_reply(email_content, subject, knowledge_base)
 
     draft_message = EmailMessage()
-    draft_message["To"] = sender
+    draft_message["To"] = parseaddr(sender)[1] or sender
     draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     if message_id:
         draft_message["In-Reply-To"] = message_id
         draft_message["References"] = f"{references} {message_id}".strip()
-    draft_message.set_content(TEST_DRAFT_TEXT)
+    draft_message.set_content(reply)
     encoded_message = base64.urlsafe_b64encode(draft_message.as_bytes()).decode()
 
     draft = (
@@ -110,6 +239,7 @@ def process_first_unread_email():
         "processed": True,
         "subject": subject,
         "draft_id": draft["id"],
+        "knowledge_base_files": kb_files,
     }
 
 

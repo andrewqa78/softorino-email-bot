@@ -47,9 +47,11 @@ softorino-email-bot/
 The current POST endpoint processes one unread inbox email:
 
 1. Finds the first unread message in the inbox.
-2. Creates a reply draft with `Test draft from Softorino Bot`.
-3. Marks the source message as read.
-4. Returns the email subject and Gmail draft ID as JSON.
+2. Fetches `global_rules.md` and relevant files from the public Knowledge Base.
+3. Sends the email content and Knowledge Base to Claude.
+4. Creates a reply draft with Claude's generated response.
+5. Marks the source message as read.
+6. Returns the email subject, selected KB files, and Gmail draft ID as JSON.
 
 Send a `POST` request to `/api/process_email` to run the test flow. A `GET`
 request only checks that the function is available and does not expose the
@@ -62,4 +64,7 @@ GMAIL_USER_EMAIL
 GMAIL_CLIENT_ID
 GMAIL_CLIENT_SECRET
 GMAIL_REFRESH_TOKEN
+ANTHROPIC_API_KEY
+
+DRY_RUN=true
 ```
