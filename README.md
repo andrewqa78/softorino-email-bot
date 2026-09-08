@@ -17,6 +17,22 @@ support@softorino.app
 The OAuth credentials and refresh token must belong to the mailbox configured in
 `GMAIL_USER_EMAIL`. Never commit them to GitHub.
 
+## Generate a Gmail refresh token locally
+
+Keep `credentials.json` in the project root. It is ignored by Git. Then run:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python get_token.py
+```
+
+Sign in with the Gmail account being tested and approve the requested Gmail
+permissions. The script saves `token.json` locally. Copy only its
+`refresh_token` value into the Vercel environment variable
+`GMAIL_REFRESH_TOKEN`; never commit either JSON file.
+
 ## Project structure
 
 ```text
