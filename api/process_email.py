@@ -148,32 +148,37 @@ def is_auto_reply(subject, sender):
 
 
 def detect_escalation_triggers(email_content):
-    """Detect escalation triggers: refunds, charges, cancellations, fraud."""
+    """Detect HARD escalation triggers only: fraud and explicit help refusal."""
     content = email_content.lower()
-    # Fraud/scam detection (HIGH PRIORITY)
-    fraud_keywords = ["scam", "fraud", "you scammed", "you lied", "false", "deceived"]
+
+    # Fraud/scam detection (HIGH PRIORITY) - always escalate
+    fraud_keywords = ["scam", "fraud", "you scammed", "you lied", "stolen"]
     for keyword in fraud_keywords:
         if keyword in content:
             return {"should_escalate": True, "reason": "Fraud/Scam Report", "priority": "HIGH PRIORITY"}
-    # Refund/charge/cancel requests (ACTIONABLE)
-    actionable_patterns = [
-        r"i want[\w\s]*refund",
-        r"give me[\w\s]*money back",
-        r"charged twice",
-        r"charged again",
-        r"cancel[\w\s]*subscription",
-        r"cancel[\w\s]*plan",
-        r"dispute[\w\s]*charge",
-        r"unauthorized[\w\s]*charge",
-        r"i didn't authorize",
+
+    # Explicit refusal to accept help - customer wants ONLY refund/cancellation, not troubleshooting
+    hard_refusal_patterns = [
+        r"just refund",
+        r"only refund",
+        r"don't want help",
+        r"don't want support",
+        r"no troubleshooting",
+        r"no support",
+        r"skip the help",
+        r"i just want.*refund",
+        r"please cancel.*no.*help",
     ]
-    for pattern in actionable_patterns:
+    for pattern in hard_refusal_patterns:
         if re.search(pattern, content):
-            return {"should_escalate": True, "reason": "Billing/Refund Request", "priority": "NORMAL"}
-    # Payment provider mentions
-    if any(provider in content for provider in ["paypal", "fastspring", "my bank", "my credit card"]):
-        if any(word in content for word in ["charge", "billing", "payment", "refund"]):
-            return {"should_escalate": True, "reason": "Payment Issue", "priority": "NORMAL"}
+            return {"should_escalate": True, "reason": "Refund Request (Customer Refuses Help)", "priority": "NORMAL"}
+
+    # Unauthorized charges (technical fraud)
+    if re.search(r"(unauthorized|didn't authorize|didn't make this|i didn't buy)", content):
+        return {"should_escalate": True, "reason": "Unauthorized Charge", "priority": "NORMAL"}
+
+    # Soft refund mentions → do NOT escalate, let Claude handle
+    # "I want a refund" + "can you help?" = offer help first
     return {"should_escalate": False}
 
 
@@ -202,6 +207,21 @@ Reply in the same language as the customer's email using ONLY the knowledge base
 Be friendly and concise. Never mention that you are an AI.
 Never promise ETAs or refunds. Never offer remote sessions.
 Sign off exactly as: Best regards, Softorino Support Team
+
+IMPORTANT - Refund/Cancellation Requests:
+When customer mentions refund or cancellation, first check if they're open to help:
+- If they ask "can you help?", "is there a solution?", "what can I do?" → offer troubleshooting
+- If they show willingness to fix the issue → guide them with solutions from KB
+- Only use fallback (escalation) if customer explicitly refuses help or issue is clearly unfixable
+
+Example good response:
+"I understand you'd like a refund. Let's first try [solution from KB]. 
+If that doesn't work, our billing team can help with next steps."
+
+Only use the fallback response below if:
+1. Customer explicitly refuses help (says "no troubleshooting", "just refund me", etc.)
+2. The issue is clearly a billing/refund matter that KB can't resolve
+
 If the knowledge base does not contain a reliable answer, reply exactly:
 Thank you for reaching out. Our support team will review your case and get back to you shortly. We appreciate your patience. Best regards, Softorino Support Team
 
