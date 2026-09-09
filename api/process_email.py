@@ -27,6 +27,7 @@ KB_BASE_URL = (
 )
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_EMAIL_CHARS = 30000
+TEST_SENDER_EMAIL = "andrewsupport78@gmail.com"
 
 
 class TextExtractor(HTMLParser):
@@ -215,6 +216,12 @@ Never use Markdown bullet points (-, *, +).
 If you need a list, use numbered lines like "1. 2. 3." instead.
 Write everything as plain text.
 
+IMPORTANT - Natural formatting:
+Write in natural paragraphs of 2-4 sentences each, the way a person writes an email.
+Do not put every sentence on its own line.
+Keep the whole reply to 3-4 paragraphs maximum.
+Keep the tone warm but professional, not robotic.
+
 IMPORTANT - Refund/Cancellation Requests:
 When customer mentions refund or cancellation, first check if they're open to help:
 - If they ask "can you help?", "is there a solution?", "what can I do?" → offer troubleshooting
@@ -300,16 +307,31 @@ This ticket requires manual attention from the support team.
     }
 
 
+def deliver_reply(service, draft_message, thread_id, dry_run):
+    """Create a Gmail draft (DRY_RUN) or send the reply immediately (live)."""
+    encoded_message = base64.urlsafe_b64encode(draft_message.as_bytes()).decode()
+    body = {"threadId": thread_id, "raw": encoded_message}
+    if dry_run:
+        draft = (
+            service.users()
+            .drafts()
+            .create(userId="me", body={"message": body})
+            .execute()
+        )
+        return {"mode": "draft", "id": draft["id"]}
+    sent = service.users().messages().send(userId="me", body=body).execute()
+    return {"mode": "sent", "id": sent["id"]}
+
+
 def process_first_unread_email():
-    if os.getenv("DRY_RUN", "true").lower() != "true":
-        raise RuntimeError("DRY_RUN must be true while draft-only testing is enabled.")
+    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     service = gmail_service()
     result = (
         service.users()
         .messages()
         .list(
             userId="me",
-            q="in:inbox is:unread -in:spam -in:trash",
+            q=f"in:inbox is:unread -in:spam -in:trash from:{TEST_SENDER_EMAIL}",
             maxResults=1,
         )
         .execute()
@@ -386,21 +408,7 @@ def process_first_unread_email():
             draft_message["In-Reply-To"] = message_id
             draft_message["References"] = f"{references} {message_id}".strip()
         draft_message.set_content(reply)
-        encoded_message = base64.urlsafe_b64encode(draft_message.as_bytes()).decode()
-        draft = (
-            service.users()
-            .drafts()
-            .create(
-                userId="me",
-                body={
-                    "message": {
-                        "threadId": message.get("threadId"),
-                        "raw": encoded_message,
-                    }
-                },
-            )
-            .execute()
-        )
+        delivery = deliver_reply(service, draft_message, message.get("threadId"), dry_run)
         service.users().messages().modify(
             userId="me",
             id=message["id"],
@@ -409,13 +417,13 @@ def process_first_unread_email():
         return {
             "processed": True,
             "subject": subject,
-            "draft_id": draft["id"],
+            "delivery": delivery,
             "knowledge_base_files": kb_files,
             "escalated": True,
             "escalation_reason": "Claude fallback answer",
         }
 
-    # Create draft with reply
+    # Deliver reply (draft in DRY_RUN, sent live otherwise)
     draft_message = EmailMessage()
     draft_message["To"] = parseaddr(sender)[1] or sender
     draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
@@ -423,22 +431,7 @@ def process_first_unread_email():
         draft_message["In-Reply-To"] = message_id
         draft_message["References"] = f"{references} {message_id}".strip()
     draft_message.set_content(reply)
-    encoded_message = base64.urlsafe_b64encode(draft_message.as_bytes()).decode()
-
-    draft = (
-        service.users()
-        .drafts()
-        .create(
-            userId="me",
-            body={
-                "message": {
-                    "threadId": message.get("threadId"),
-                    "raw": encoded_message,
-                }
-            },
-        )
-        .execute()
-    )
+    delivery = deliver_reply(service, draft_message, message.get("threadId"), dry_run)
     service.users().messages().modify(
         userId="me",
         id=message["id"],
@@ -448,7 +441,7 @@ def process_first_unread_email():
     return {
         "processed": True,
         "subject": subject,
-        "draft_id": draft["id"],
+        "delivery": delivery,
         "knowledge_base_files": kb_files,
     }
 
