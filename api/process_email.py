@@ -184,17 +184,22 @@ def detect_escalation_triggers(email_content):
 
 
 def detect_sensitive_content(email_content, subject):
-    """Detect threats, legal language, severe insults."""
+    """Detect explicit threats, legal language, or profanity only.
+
+    Word-boundary matching on purpose: plain substring checks previously
+    flagged normal words like "issue" (contains "sue") and "courtesy"
+    (contains "court") as sensitive.
+    """
     combined = (email_content + " " + subject).lower()
-    sensitive_keywords = [
-        "lawyer", "attorney", "sue", "court", "legal action",
-        "police", "fbi", "report to", "death threat", "kill you",
-        "scam you", "stolen", "hack", "blackmail"
+    sensitive_patterns = [
+        r"\blawyer\b", r"\battorney\b", r"\bsue you\b", r"\blawsuit\b",
+        r"\blegal action\b", r"\bpress charges\b", r"\bcourt\b",
+        r"\bpolice\b", r"\bfbi\b", r"\bblackmail\b",
+        r"\bdeath threat\b", r"\bkill you\b", r"\bi(?:'ll| will) kill\b", r"\bhurt you\b",
+        r"\bfuck\w*\b", r"\bshit\w*\b", r"\basshole\w*\b", r"\bbastard\w*\b",
+        r"\bbitch\w*\b", r"\bcunt\w*\b",
     ]
-    for keyword in sensitive_keywords:
-        if keyword in combined:
-            return True
-    return False
+    return any(re.search(pattern, combined) for pattern in sensitive_patterns)
 
 
 
