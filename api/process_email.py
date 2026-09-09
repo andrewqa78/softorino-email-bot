@@ -135,13 +135,70 @@ def build_knowledge_base(email_content):
     return "".join(sections), files
 
 
-def generate_reply(email_content, subject, knowledge_base):
+def is_auto_reply(subject, sender):
+    """Check if email is an auto-reply or bounce-back."""
+    auto_reply_keywords = ["out of office", "auto-reply", "automatic reply", "delivery failed", "undeliverable", "mail delivery"]
+    auto_reply_senders = ["mailer-daemon@", "postmaster@", "noreply@", "no-reply@"]
+    subject_lower = subject.lower()
+    if any(keyword in subject_lower for keyword in auto_reply_keywords):
+        return True
+    if any(sender.lower().startswith(prefix) for prefix in auto_reply_senders):
+        return True
+    return False
+
+
+def detect_escalation_triggers(email_content):
+    """Detect escalation triggers: refunds, charges, cancellations, fraud."""
+    content = email_content.lower()
+    # Fraud/scam detection (HIGH PRIORITY)
+    fraud_keywords = ["scam", "fraud", "you scammed", "you lied", "false", "deceived"]
+    for keyword in fraud_keywords:
+        if keyword in content:
+            return {"should_escalate": True, "reason": "Fraud/Scam Report", "priority": "HIGH PRIORITY"}
+    # Refund/charge/cancel requests (ACTIONABLE)
+    actionable_patterns = [
+        r"i want[\w\s]*refund",
+        r"give me[\w\s]*money back",
+        r"charged twice",
+        r"charged again",
+        r"cancel[\w\s]*subscription",
+        r"cancel[\w\s]*plan",
+        r"dispute[\w\s]*charge",
+        r"unauthorized[\w\s]*charge",
+        r"i didn't authorize",
+    ]
+    for pattern in actionable_patterns:
+        if re.search(pattern, content):
+            return {"should_escalate": True, "reason": "Billing/Refund Request", "priority": "NORMAL"}
+    # Payment provider mentions
+    if any(provider in content for provider in ["paypal", "fastspring", "my bank", "my credit card"]):
+        if any(word in content for word in ["charge", "billing", "payment", "refund"]):
+            return {"should_escalate": True, "reason": "Payment Issue", "priority": "NORMAL"}
+    return {"should_escalate": False}
+
+
+def detect_sensitive_content(email_content, subject):
+    """Detect threats, legal language, severe insults."""
+    combined = (email_content + " " + subject).lower()
+    sensitive_keywords = [
+        "lawyer", "attorney", "sue", "court", "legal action",
+        "police", "fbi", "report to", "death threat", "kill you",
+        "scam you", "stolen", "hack", "blackmail"
+    ]
+    for keyword in sensitive_keywords:
+        if keyword in combined:
+            return True
+    return False
+
+
+
+def generate_reply(email_content, subject, knowledge_base, max_retries=2):
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("Missing environment variable: ANTHROPIC_API_KEY")
     client = anthropic.Anthropic(api_key=api_key)
     system_prompt = f"""You are a Softorino customer support agent named Sofi.
-Reply in English using ONLY the knowledge base provided below.
+Reply in the same language as the customer's email using ONLY the knowledge base provided below.
 Be friendly and concise. Never mention that you are an AI.
 Never promise ETAs or refunds. Never offer remote sessions.
 Sign off exactly as: Best regards, Softorino Support Team
@@ -151,36 +208,45 @@ Thank you for reaching out. Our support team will review your case and get back 
 Knowledge base:
 {knowledge_base}
 """
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1200,
-        system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Customer email subject: {subject}\n\nCustomer email:\n{email_content}",
-            }
-        ],
-    )
-    reply = "".join(block.text for block in response.content if block.type == "text").strip()
-    if not reply:
-        raise RuntimeError("Claude returned an empty reply.")
-    return reply
+    import time
+    for attempt in range(max_retries):
+        try:
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1200,
+                system=system_prompt,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Customer email subject: {subject}\n\nCustomer email:\n{email_content}",
+                    }
+                ],
+            )
+            reply = "".join(block.text for block in response.content if block.type == "text").strip()
+            if not reply:
+                raise RuntimeError("Claude returned an empty reply.")
+            return reply
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"Claude API failed after {max_retries} attempts: {e}")
+            time.sleep(3)
 
 
-def escalate_email(service, sender, subject, email_content, reason):
+def escalate_email(service, sender, subject, email_content, reason, priority="NORMAL"):
     escalation_email = os.getenv("ESCALATION_EMAIL_1")
     if not escalation_email:
         raise RuntimeError("Missing environment variable: ESCALATION_EMAIL_1")
 
+    subject_prefix = f"[{priority}] " if priority != "NORMAL" else "[ESCALATION] "
     escalation_body = f"""[ESCALATION NOTIFICATION]
+Priority: {priority}
 
 Customer Email: {sender}
 Subject: {subject}
 Reason: {reason}
 
 --- Original Message ---
-{email_content}
+{email_content[:2000]}
 
 --- End of Original Message ---
 
@@ -190,7 +256,7 @@ This ticket requires manual attention from the support team.
     escalation_msg = EmailMessage()
     escalation_msg["To"] = escalation_email
     escalation_msg["From"] = os.getenv("GMAIL_USER_EMAIL", "support@softorino.app")
-    escalation_msg["Subject"] = f"[ESCALATION] {subject} — {sender}"
+    escalation_msg["Subject"] = f"{subject_prefix}{subject} — {sender}"
     escalation_msg.set_content(escalation_body)
 
     encoded_escalation = base64.urlsafe_b64encode(escalation_msg.as_bytes()).decode()
@@ -203,6 +269,7 @@ This ticket requires manual attention from the support team.
         "escalated": True,
         "recipient": escalation_email,
         "reason": reason,
+        "priority": priority,
     }
 
 
@@ -241,10 +308,87 @@ def process_first_unread_email():
     if not email_content:
         raise RuntimeError("Unread email does not contain readable text.")
 
+    # Check for auto-reply/bounce-back
+    if is_auto_reply(subject, sender):
+        service.users().messages().modify(
+            userId="me",
+            id=message["id"],
+            body={"removeLabelIds": ["UNREAD"]},
+        ).execute()
+        return {"processed": False, "message": "Auto-reply or bounce-back detected. Skipped."}
+
+    # Check for sensitive content (threats/legal language)
+    if detect_sensitive_content(email_content, subject):
+        escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE")
+        service.users().messages().modify(
+            userId="me",
+            id=message["id"],
+            body={"removeLabelIds": ["UNREAD"]},
+        ).execute()
+        return {"processed": False, "message": "Sensitive content detected. Escalated without auto-reply."}
+
+    # Check for escalation triggers
+    escalation_check = detect_escalation_triggers(email_content)
+    if escalation_check["should_escalate"]:
+        knowledge_base, kb_files = build_knowledge_base(email_content)
+        escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
+        service.users().messages().modify(
+            userId="me",
+            id=message["id"],
+            body={"removeLabelIds": ["UNREAD"]},
+        ).execute()
+        return {
+            "processed": False,
+            "message": "Escalation trigger detected. Escalated to ops team.",
+            "escalation_reason": escalation_check["reason"],
+            "knowledge_base_files": kb_files,
+        }
+
+    # Generate reply
     knowledge_base, kb_files = build_knowledge_base(email_content)
     reply = generate_reply(email_content, subject, knowledge_base)
 
-    draft_message = EmailMessage()
+    # Check if Claude returned fallback answer (should escalate)
+    if "our support team will review your case" in reply.lower():
+        escalate_email(service, sender, subject, email_content, "Claude fallback: No KB answer found", priority="NORMAL")
+        # Still create draft for reference
+        draft_message = EmailMessage()
+        draft_message["To"] = parseaddr(sender)[1] or sender
+        draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        if message_id:
+            draft_message["In-Reply-To"] = message_id
+            draft_message["References"] = f"{references} {message_id}".strip()
+        draft_message.set_content(reply)
+        encoded_message = base64.urlsafe_b64encode(draft_message.as_bytes()).decode()
+        draft = (
+            service.users()
+            .drafts()
+            .create(
+                userId="me",
+                body={
+                    "message": {
+                        "threadId": message.get("threadId"),
+                        "raw": encoded_message,
+                    }
+                },
+            )
+            .execute()
+        )
+        service.users().messages().modify(
+            userId="me",
+            id=message["id"],
+            body={"removeLabelIds": ["UNREAD"]},
+        ).execute()
+        return {
+            "processed": True,
+            "subject": subject,
+            "draft_id": draft["id"],
+            "knowledge_base_files": kb_files,
+            "escalated": True,
+            "escalation_reason": "Claude fallback answer",
+        }
+
+    # Create draft with reply
     draft_message["To"] = parseaddr(sender)[1] or sender
     draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     if message_id:
