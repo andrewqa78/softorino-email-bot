@@ -409,6 +409,7 @@ def process_first_unread_email():
         }
 
     # Create draft with reply
+    draft_message = EmailMessage()
     draft_message["To"] = parseaddr(sender)[1] or sender
     draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     if message_id:
