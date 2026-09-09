@@ -46,12 +46,21 @@ softorino-email-bot/
 
 The current POST endpoint processes one unread inbox email:
 
-1. Finds the first unread message in the inbox.
-2. Fetches `global_rules.md` and relevant files from the public Knowledge Base.
-3. Sends the email content and Knowledge Base to Claude.
-4. Creates a reply draft with Claude's generated response.
-5. Marks the source message as read.
-6. Returns the email subject, selected KB files, and Gmail draft ID as JSON.
+1. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
+2. **Detect sensitive content** — Escalates without auto-reply if email contains threats, legal language, or severe insults
+3. **Check escalation triggers** — Escalates if customer mentions refunds, charges, cancellations, fraud, or payment providers (PayPal, FastSpring, etc.)
+4. **Generate AI reply** — Fetches relevant KB files and sends email + KB to Claude API
+5. **Validate Claude response** — If Claude returns fallback answer ("our team will review"), escalates to ops team
+6. **Create draft reply** — Saves reply as a Gmail draft (never auto-sends in draft-only mode)
+7. **Mark as read** — Only marks email as read after successful processing
+8. **Return status** — JSON response with draft ID, escalation reason (if any), and KB files used
+
+Retry logic: Claude API retries once after 3-second delay if request fails. If both attempts fail, email remains unread for next Cron run.
+
+**Escalation priorities:**
+- `[SENSITIVE]` — Threats, legal language, or abuse (no auto-reply sent)
+- `[HIGH PRIORITY]` — Fraud or scam reports (escalate to ops immediately)
+- `[ESCALATION]` — Billing/refund/cancellation requests, unknown topics, payment failures
 
 Send a `POST` request to `/api/process_email` to run the test flow. A `GET`
 request only checks that the function is available and does not expose the
