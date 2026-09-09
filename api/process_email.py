@@ -102,6 +102,32 @@ def message_text(payload):
     return text.strip()
 
 
+QUOTE_BOUNDARY_PATTERNS = [
+    re.compile(r"^\s*On .{0,120}?wrote:\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*From:\s.+$", re.MULTILINE),
+    re.compile(r"^\s*>", re.MULTILINE),
+]
+
+
+def split_latest_message(text):
+    """Split an email body into (latest reply, quoted thread history).
+
+    Reply clients append the full quoted thread below the new text, so
+    without this the rule-based checks (escalation, sensitive content)
+    would react to an older message in the thread instead of what the
+    customer just wrote.
+    """
+    cut_at = len(text)
+    for pattern in QUOTE_BOUNDARY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            cut_at = min(cut_at, match.start())
+    latest = text[:cut_at].strip()
+    older = text[cut_at:].strip()
+    return (latest or text.strip()), older
+
+
 def fetch_kb_file(filename):
     request = UrlRequest(KB_BASE_URL + filename, headers={"User-Agent": "Softorino-Email-Bot"})
     with urlopen(request, timeout=10) as response:
@@ -203,7 +229,7 @@ def detect_sensitive_content(email_content, subject):
 
 
 
-def generate_reply(email_content, subject, knowledge_base, max_retries=2):
+def generate_reply(latest_message, subject, knowledge_base, thread_context="", max_retries=2):
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("Missing environment variable: ANTHROPIC_API_KEY")
@@ -227,6 +253,13 @@ Do not put every sentence on its own line.
 Keep the whole reply to 3-4 paragraphs maximum.
 Keep the tone warm but professional, not robotic.
 
+IMPORTANT - Escalation decisions use the latest message only:
+Base your reply and any escalation/fallback decision ONLY on the customer's
+latest message below. Earlier thread history is provided for context only —
+e.g. to avoid repeating troubleshooting steps already suggested. Never treat
+an older message in the thread (such as a past refund request) as the
+customer's current request if the latest message asks something else.
+
 IMPORTANT - Refund/Cancellation Requests:
 When customer mentions refund or cancellation, first check if they're open to help:
 - If they ask "can you help?", "is there a solution?", "what can I do?" → offer troubleshooting
@@ -247,6 +280,17 @@ Thank you for reaching out. Our support team will review your case and get back 
 Knowledge base:
 {knowledge_base}
 """
+    user_content = f"Customer email subject: {subject}\n\n"
+    if thread_context:
+        user_content += (
+            "Earlier thread history (context only — do not base the "
+            f"escalation decision on this):\n{thread_context}\n\n"
+        )
+    user_content += (
+        "Customer's latest message (base your reply and escalation decision "
+        f"on this):\n{latest_message}"
+    )
+
     import time
     for attempt in range(max_retries):
         try:
@@ -257,7 +301,7 @@ Knowledge base:
                 messages=[
                     {
                         "role": "user",
-                        "content": f"Customer email subject: {subject}\n\nCustomer email:\n{email_content}",
+                        "content": user_content,
                     }
                 ],
             )
@@ -362,6 +406,11 @@ def process_first_unread_email():
     if not email_content:
         raise RuntimeError("Unread email does not contain readable text.")
 
+    # Reply clients append quoted thread history below the new text. Rule-based
+    # checks below must react to what the customer just wrote, not to an older
+    # message quoted further down (e.g. a past refund request in the thread).
+    latest_message, thread_context = split_latest_message(email_content)
+
     # Check for auto-reply/bounce-back
     if is_auto_reply(subject, sender):
         service.users().messages().modify(
@@ -372,7 +421,7 @@ def process_first_unread_email():
         return {"processed": False, "message": "Auto-reply or bounce-back detected. Skipped."}
 
     # Check for sensitive content (threats/legal language)
-    if detect_sensitive_content(email_content, subject):
+    if detect_sensitive_content(latest_message, subject):
         escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE")
         service.users().messages().modify(
             userId="me",
@@ -382,7 +431,7 @@ def process_first_unread_email():
         return {"processed": False, "message": "Sensitive content detected. Escalated without auto-reply."}
 
     # Check for escalation triggers
-    escalation_check = detect_escalation_triggers(email_content)
+    escalation_check = detect_escalation_triggers(latest_message)
     if escalation_check["should_escalate"]:
         knowledge_base, kb_files = build_knowledge_base(email_content)
         escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
@@ -400,7 +449,7 @@ def process_first_unread_email():
 
     # Generate reply
     knowledge_base, kb_files = build_knowledge_base(email_content)
-    reply = generate_reply(email_content, subject, knowledge_base)
+    reply = generate_reply(latest_message, subject, knowledge_base, thread_context)
 
     # Check if Claude returned fallback answer (should escalate)
     if "our support team will review your case" in reply.lower():
