@@ -336,9 +336,22 @@ Knowledge base:
 
 
 def escalate_email(service, sender, subject, email_content, reason, priority="NORMAL"):
-    escalation_email = os.getenv("ESCALATION_EMAIL_1")
-    if not escalation_email:
-        raise RuntimeError("Missing environment variable: ESCALATION_EMAIL_1")
+    recipients = [
+        email
+        for email in (os.getenv("ESCALATION_EMAIL_1"), os.getenv("ESCALATION_EMAIL_2"))
+        if email
+    ]
+    if not recipients:
+        print(
+            f"[ESCALATION] SKIPPED — no ESCALATION_EMAIL_1/ESCALATION_EMAIL_2 configured. "
+            f"reason={reason!r} priority={priority}"
+        )
+        return {"escalated": False, "recipients": [], "reason": reason, "priority": priority}
+
+    print(
+        f"[ESCALATION] Attempting notification to {recipients} — "
+        f"reason={reason!r} priority={priority}"
+    )
 
     subject_prefix = f"[{priority}] " if priority != "NORMAL" else "[ESCALATION] "
     escalation_body = f"""[ESCALATION NOTIFICATION]
@@ -357,20 +370,31 @@ This ticket requires manual attention from the support team.
 """
 
     escalation_msg = EmailMessage()
-    escalation_msg["To"] = escalation_email
+    escalation_msg["To"] = ", ".join(recipients)
     escalation_msg["From"] = os.getenv("GMAIL_USER_EMAIL", "support@softorino.app")
     escalation_msg["Subject"] = f"{subject_prefix}{subject} — {sender}"
     escalation_msg.set_content(escalation_body)
 
     encoded_escalation = base64.urlsafe_b64encode(escalation_msg.as_bytes()).decode()
-    service.users().messages().send(
-        userId="me",
-        body={"raw": encoded_escalation},
-    ).execute()
+    try:
+        service.users().messages().send(
+            userId="me",
+            body={"raw": encoded_escalation},
+        ).execute()
+    except Exception as error:
+        print(f"[ESCALATION] FAILED to send notification to {recipients}: {error}")
+        return {
+            "escalated": False,
+            "recipients": recipients,
+            "reason": reason,
+            "priority": priority,
+            "error": str(error),
+        }
 
+    print(f"[ESCALATION] SENT notification to {recipients}")
     return {
         "escalated": True,
-        "recipient": escalation_email,
+        "recipients": recipients,
         "reason": reason,
         "priority": priority,
     }
@@ -455,19 +479,23 @@ def process_single_message(service, message, dry_run):
 
     # Check for sensitive content (threats/legal language)
     if detect_sensitive_content(latest_message, subject):
-        escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE")
+        escalation_result = escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE")
         service.users().messages().modify(
             userId="me",
             id=message["id"],
             body={"removeLabelIds": ["UNREAD"]},
         ).execute()
-        return {"processed": False, "message": "Sensitive content detected. Escalated without auto-reply."}
+        return {
+            "processed": False,
+            "message": "Sensitive content detected. Escalated without auto-reply.",
+            "escalation": escalation_result,
+        }
 
     # Check for escalation triggers
     escalation_check = detect_escalation_triggers(latest_message)
     if escalation_check["should_escalate"]:
         knowledge_base, kb_files = build_knowledge_base(email_content)
-        escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
+        escalation_result = escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
         service.users().messages().modify(
             userId="me",
             id=message["id"],
@@ -478,6 +506,7 @@ def process_single_message(service, message, dry_run):
             "message": "Escalation trigger detected. Escalated to ops team.",
             "escalation_reason": escalation_check["reason"],
             "knowledge_base_files": kb_files,
+            "escalation": escalation_result,
         }
 
     # Generate reply
@@ -486,7 +515,7 @@ def process_single_message(service, message, dry_run):
 
     # Check if Claude returned fallback answer (should escalate)
     if "our support team will review your case" in reply.lower():
-        escalate_email(service, sender, subject, email_content, "Claude fallback: No KB answer found", priority="NORMAL")
+        escalation_result = escalate_email(service, sender, subject, email_content, "Claude fallback: No KB answer found", priority="NORMAL")
         # Still create draft for reference
         draft_message = EmailMessage()
         draft_message["To"] = parseaddr(sender)[1] or sender
@@ -508,6 +537,7 @@ def process_single_message(service, message, dry_run):
             "knowledge_base_files": kb_files,
             "escalated": True,
             "escalation_reason": "Claude fallback answer",
+            "escalation": escalation_result,
         }
 
     # Deliver reply (draft in DRY_RUN, sent live otherwise)
