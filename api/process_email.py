@@ -149,6 +149,25 @@ def split_latest_message(text):
     return (latest or text.strip()), older
 
 
+ESCALATION_MARKER_PATTERN = re.compile(r"\n?\[\[ESCALATE:\s*(.*?)\]\]\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def extract_escalation_marker(reply):
+    """Strip Claude's trailing [[ESCALATE: reason]] marker, if present.
+
+    Claude's KB-approved reply templates (e.g. "I've forwarded this to our
+    billing team") never contain the hardcoded fallback sentence, so without
+    this marker the bot had no way to know a KB-templated reply also needs an
+    ops notification. Returns (customer_facing_reply, reason_or_none).
+    """
+    match = ESCALATION_MARKER_PATTERN.search(reply)
+    if not match:
+        return reply.strip(), None
+    clean_reply = reply[: match.start()].rstrip()
+    reason = match.group(1).strip() or "Claude flagged this reply for escalation"
+    return clean_reply, reason
+
+
 def fetch_kb_file(filename):
     request = UrlRequest(KB_BASE_URL + filename, headers={"User-Agent": "Softorino-Email-Bot"})
     with urlopen(request, timeout=10) as response:
@@ -298,6 +317,20 @@ Only use the fallback response below if:
 If the knowledge base does not contain a reliable answer, reply exactly:
 Thank you for reaching out. Our support team will review your case and get back to you shortly. We appreciate your patience. Best regards, Softorino Support Team
 
+IMPORTANT - Escalation marker:
+The knowledge base below (see "Escalation to Human Agent" and "Billing and
+Refund Escalation Rules" in global_rules.md) defines when a ticket needs a
+human agent instead of being fully resolved by you -- e.g. billing/refund/
+cancellation/renewal/payment action triggers, a known bug with no workaround,
+an issue needing internal system access, or exhausted troubleshooting.
+Whenever any of those conditions apply, write your normal customer-facing
+reply using the approved KB templates, then add ONE extra final line by
+itself, in exactly this format:
+[[ESCALATE: short reason]]
+This line is stripped before the customer sees the email -- it only signals
+our support team to also get notified. Do not add it for cases you fully
+resolve yourself (activation steps, explanations, standard troubleshooting).
+
 Knowledge base:
 {knowledge_base}
 """
@@ -348,6 +381,7 @@ def escalate_email(service, sender, subject, email_content, reason, priority="NO
         )
         return {"escalated": False, "recipients": [], "reason": reason, "priority": priority}
 
+    print("Sending escalation to: ", recipients)
     print(
         f"[ESCALATION] Attempting notification to {recipients} — "
         f"reason={reason!r} priority={priority}"
@@ -377,6 +411,9 @@ This ticket requires manual attention from the support team.
 
     encoded_escalation = base64.urlsafe_b64encode(escalation_msg.as_bytes()).decode()
     try:
+        # No threadId/In-Reply-To/References set above: this is always sent
+        # as a brand-new message/thread to the ops team, never as a reply in
+        # the customer's thread.
         service.users().messages().send(
             userId="me",
             body={"raw": encoded_escalation},
@@ -511,12 +548,16 @@ def process_single_message(service, message, dry_run):
 
     # Generate reply
     knowledge_base, kb_files = build_knowledge_base(email_content)
-    reply = generate_reply(latest_message, subject, knowledge_base, thread_context)
+    raw_reply = generate_reply(latest_message, subject, knowledge_base, thread_context)
+    reply, marker_reason = extract_escalation_marker(raw_reply)
 
-    # Check if Claude returned fallback answer (should escalate)
-    if "our support team will review your case" in reply.lower():
-        escalation_result = escalate_email(service, sender, subject, email_content, "Claude fallback: No KB answer found", priority="NORMAL")
-        # Still create draft for reference
+    # Escalate if Claude flagged this reply (KB-templated escalation, e.g.
+    # billing action triggers or a known bug) or used the no-answer fallback.
+    is_fallback_reply = "our support team will review your case" in reply.lower()
+    if marker_reason or is_fallback_reply:
+        escalation_reason = marker_reason or "Claude fallback: No KB answer found"
+        escalation_result = escalate_email(service, sender, subject, email_content, escalation_reason, priority="NORMAL")
+        # Still send/draft the customer-facing reply
         draft_message = EmailMessage()
         draft_message["To"] = parseaddr(sender)[1] or sender
         draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
@@ -536,7 +577,7 @@ def process_single_message(service, message, dry_run):
             "delivery": delivery,
             "knowledge_base_files": kb_files,
             "escalated": True,
-            "escalation_reason": "Claude fallback answer",
+            "escalation_reason": escalation_reason,
             "escalation": escalation_result,
         }
 
