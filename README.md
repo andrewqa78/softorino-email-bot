@@ -44,16 +44,18 @@ softorino-email-bot/
 └── README.md
 ```
 
-The current POST endpoint processes one unread inbox email:
+The current POST endpoint processes up to 5 unread inbox emails per run
+(1 second delay between each):
 
-1. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
-2. **Detect sensitive content** — Escalates without auto-reply if email contains threats, legal language, or severe insults
-3. **Check escalation triggers** — Escalates if customer mentions refunds, charges, cancellations, fraud, or payment providers (PayPal, FastSpring, etc.)
-4. **Generate AI reply** — Fetches relevant KB files and sends email + KB to Claude API
-5. **Validate Claude response** — If Claude returns fallback answer ("our team will review"), escalates to ops team
-6. **Create draft reply** — Saves reply as a Gmail draft (never auto-sends in draft-only mode)
-7. **Mark as read** — Only marks email as read after successful processing
-8. **Return status** — JSON response with draft ID, escalation reason (if any), and KB files used
+1. **Filter at fetch time** — Gmail query only returns mail from the last 7 days, and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
+2. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
+3. **Detect sensitive content** — Escalates without auto-reply if email contains threats, legal language, or severe insults
+4. **Check escalation triggers** — Escalates if customer mentions refunds, charges, cancellations, fraud, or payment providers (PayPal, FastSpring, etc.)
+5. **Generate AI reply** — Fetches relevant KB files and sends email + KB to Claude API
+6. **Validate Claude response** — If Claude returns fallback answer ("our team will review"), escalates to ops team
+7. **Create draft reply** — Saves reply as a Gmail draft (never auto-sends in draft-only mode)
+8. **Mark as read** — Only marks email as read after successful processing
+9. **Return status** — JSON response with `processed_count` and a `results` array (one entry per email) with draft ID, escalation reason (if any), and KB files used
 
 Retry logic: Claude API retries once after 3-second delay if request fails. If both attempts fail, email remains unread for next Cron run.
 

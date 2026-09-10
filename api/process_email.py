@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import time
 from email.message import EmailMessage
 from email.utils import parseaddr
 from http.server import BaseHTTPRequestHandler
@@ -28,6 +29,26 @@ KB_BASE_URL = (
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_EMAIL_CHARS = 30000
 TEST_SENDER_EMAIL = "andrewsupport78@gmail.com"
+
+MAX_EMAILS_PER_RUN = 5
+PROCESS_WINDOW_DAYS = 7
+DELAY_BETWEEN_EMAILS_SECONDS = 1
+EXCLUDED_SENDER_TERMS = ["noreply", "no-reply", "mailer-daemon"]
+EXCLUDED_SUBJECT_TERMS = [
+    "unsubscribe", "newsletter", "notification", "invoice",
+    "receipt", "order confirmation", "auto-reply", "out of office",
+]
+
+
+def build_unread_query():
+    terms = [
+        "in:inbox", "is:unread", "-in:spam", "-in:trash",
+        f"newer_than:{PROCESS_WINDOW_DAYS}d",
+        f"from:{TEST_SENDER_EMAIL}",
+    ]
+    terms += [f"-from:{term}" for term in EXCLUDED_SENDER_TERMS]
+    terms += [f'-subject:"{term}"' for term in EXCLUDED_SUBJECT_TERMS]
+    return " ".join(terms)
 
 
 class TextExtractor(HTMLParser):
@@ -291,7 +312,6 @@ Knowledge base:
         f"on this):\n{latest_message}"
     )
 
-    import time
     for attempt in range(max_retries):
         try:
             response = client.messages.create(
@@ -372,7 +392,7 @@ def deliver_reply(service, draft_message, thread_id, dry_run):
     return {"mode": "sent", "id": sent["id"]}
 
 
-def process_first_unread_email():
+def process_unread_emails():
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     service = gmail_service()
     result = (
@@ -380,21 +400,34 @@ def process_first_unread_email():
         .messages()
         .list(
             userId="me",
-            q=f"in:inbox is:unread -in:spam -in:trash from:{TEST_SENDER_EMAIL}",
-            maxResults=1,
+            q=build_unread_query(),
+            maxResults=MAX_EMAILS_PER_RUN,
         )
         .execute()
     )
-    messages = result.get("messages", [])
-    if not messages:
-        return {"processed": False, "message": "No unread inbox email found."}
+    message_refs = result.get("messages", [])
+    if not message_refs:
+        return {"processed_count": 0, "results": [], "message": "No unread inbox email found."}
 
-    message = (
-        service.users()
-        .messages()
-        .get(userId="me", id=messages[0]["id"], format="full")
-        .execute()
-    )
+    results = []
+    for index, message_ref in enumerate(message_refs):
+        if index > 0:
+            time.sleep(DELAY_BETWEEN_EMAILS_SECONDS)
+        message = (
+            service.users()
+            .messages()
+            .get(userId="me", id=message_ref["id"], format="full")
+            .execute()
+        )
+        try:
+            results.append(process_single_message(service, message, dry_run))
+        except Exception as error:
+            results.append({"processed": False, "error": str(error)})
+
+    return {"processed_count": len(results), "results": results}
+
+
+def process_single_message(service, message, dry_run):
     headers = message.get("payload", {}).get("headers", [])
     sender = header_value(headers, "Reply-To") or header_value(headers, "From")
     subject = header_value(headers, "Subject") or "(no subject)"
@@ -514,7 +547,7 @@ class handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            response = process_first_unread_email()
+            response = process_unread_emails()
             self._write_json(200, response)
         except Exception as error:
             self._write_json(
