@@ -168,6 +168,46 @@ def extract_escalation_marker(reply):
     return clean_reply, reason
 
 
+ESCALATION_NOTICE_PHRASE = "forwarded your case to our support team"
+
+
+def ensure_escalation_notice(reply):
+    """Guarantee the canonical escalation phrase appears in the customer reply.
+
+    Claude's own KB-approved phrasing varies ("I've forwarded this to our
+    billing team", etc.), which is too unreliable to search for later. Adding
+    this exact, fixed sentence whenever we escalate lets thread_already_escalated()
+    detect "we already escalated this thread" deterministically.
+    """
+    if ESCALATION_NOTICE_PHRASE in reply.lower():
+        return reply
+    return f"{reply}\n\nWe have forwarded your case to our support team for further review."
+
+
+def thread_already_escalated(service, thread_id):
+    """Check the thread for a prior reply that already notified the customer
+    of an escalation, so we don't notify ops again for the same open case."""
+    if not thread_id:
+        return False
+    own_email = (os.getenv("GMAIL_USER_EMAIL") or "").strip().lower()
+    if not own_email:
+        return False
+    try:
+        thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    except Exception as error:
+        print(f"[ESCALATION] Could not read thread {thread_id} for dedup check: {error}")
+        return False
+    for thread_message in thread.get("messages", []):
+        headers = thread_message.get("payload", {}).get("headers", [])
+        sender = header_value(headers, "From").lower()
+        if own_email not in sender:
+            continue
+        body = message_text(thread_message.get("payload", {})).lower()
+        if ESCALATION_NOTICE_PHRASE in body:
+            return True
+    return False
+
+
 def fetch_kb_file(filename):
     request = UrlRequest(KB_BASE_URL + filename, headers={"User-Agent": "Softorino-Email-Bot"})
     with urlopen(request, timeout=10) as response:
@@ -317,15 +357,18 @@ Only use the fallback response below if:
 If the knowledge base does not contain a reliable answer, reply exactly:
 Thank you for reaching out. Our support team will review your case and get back to you shortly. We appreciate your patience. Best regards, Softorino Support Team
 
-IMPORTANT - Escalation marker:
-The knowledge base below (see "Escalation to Human Agent" and "Billing and
-Refund Escalation Rules" in global_rules.md) defines when a ticket needs a
-human agent instead of being fully resolved by you -- e.g. billing/refund/
-cancellation/renewal/payment action triggers, a known bug with no workaround,
-an issue needing internal system access, or exhausted troubleshooting.
-Whenever any of those conditions apply, write your normal customer-facing
-reply using the approved KB templates, then add ONE extra final line by
-itself, in exactly this format:
+IMPORTANT - Escalation marker (use sparingly):
+Only add this marker when you explicitly cannot help the customer any
+further yourself and a human agent must take over now -- e.g. a billing/
+refund/cancellation action trigger that requires internal system access,
+a known bug with no workaround, or troubleshooting that is genuinely
+exhausted. Do NOT add it as a precaution, and do NOT add it again in a
+thread where you already added it and are still actively guiding the
+customer through next steps -- only when this specific reply is the point
+where you hand off to a human.
+When it applies, write your normal customer-facing reply using the
+approved KB templates, then add ONE extra final line by itself, in
+exactly this format:
 [[ESCALATE: short reason]]
 This line is stripped before the customer sees the email -- it only signals
 our support team to also get notified. Do not add it for cases you fully
@@ -556,7 +599,19 @@ def process_single_message(service, message, dry_run):
     is_fallback_reply = "our support team will review your case" in reply.lower()
     if marker_reason or is_fallback_reply:
         escalation_reason = marker_reason or "Claude fallback: No KB answer found"
-        escalation_result = escalate_email(service, sender, subject, email_content, escalation_reason, priority="NORMAL")
+        thread_id = message.get("threadId")
+        if thread_already_escalated(service, thread_id):
+            print(f"[ESCALATION] Thread {thread_id} was already escalated earlier — skipping duplicate ops notification.")
+            escalation_result = {
+                "escalated": False,
+                "recipients": [],
+                "reason": escalation_reason,
+                "priority": "NORMAL",
+                "skipped_duplicate": True,
+            }
+        else:
+            escalation_result = escalate_email(service, sender, subject, email_content, escalation_reason, priority="NORMAL")
+            reply = ensure_escalation_notice(reply)
         # Still send/draft the customer-facing reply
         draft_message = EmailMessage()
         draft_message["To"] = parseaddr(sender)[1] or sender
