@@ -184,27 +184,66 @@ def ensure_escalation_notice(reply):
     return f"{reply}\n\nWe have forwarded your case to our support team for further review."
 
 
+def _own_mailbox_address(service):
+    """Resolve the authenticated mailbox's own address.
+
+    Prefer Gmail's own profile over the GMAIL_USER_EMAIL env var: if that
+    env var ever drifts from the actual OAuth account (typo, different
+    case, alias), a From-header comparison against it would silently never
+    match and the dedup check below would always say "not escalated yet".
+    """
+    env_value = (os.getenv("GMAIL_USER_EMAIL") or "").strip().lower()
+    profile_email = ""
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        profile_email = (profile.get("emailAddress") or "").strip().lower()
+    except Exception as error:
+        print(f"[ESCALATION-DEDUP] Could not fetch Gmail profile address: {error}")
+    own_email = profile_email or env_value
+    print(
+        f"[ESCALATION-DEDUP] own mailbox address resolved to {own_email!r} "
+        f"(profile={profile_email!r}, env GMAIL_USER_EMAIL={env_value!r})"
+    )
+    return own_email
+
+
 def thread_already_escalated(service, thread_id):
     """Check the thread for a prior reply that already notified the customer
     of an escalation, so we don't notify ops again for the same open case."""
+    print(f"[ESCALATION-DEDUP] Checking thread_id={thread_id!r}")
     if not thread_id:
+        print("[ESCALATION-DEDUP] No thread_id — decision: ESCALATE (cannot check history)")
         return False
-    own_email = (os.getenv("GMAIL_USER_EMAIL") or "").strip().lower()
+
+    own_email = _own_mailbox_address(service)
     if not own_email:
+        print("[ESCALATION-DEDUP] Could not resolve own mailbox address — decision: ESCALATE")
         return False
+
     try:
         thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
     except Exception as error:
-        print(f"[ESCALATION] Could not read thread {thread_id} for dedup check: {error}")
+        print(f"[ESCALATION-DEDUP] FAILED to read thread {thread_id}: {error} — decision: ESCALATE")
         return False
-    for thread_message in thread.get("messages", []):
+
+    thread_messages = thread.get("messages", [])
+    print(f"[ESCALATION-DEDUP] Thread {thread_id}: found {len(thread_messages)} message(s)")
+
+    for thread_message in thread_messages:
         headers = thread_message.get("payload", {}).get("headers", [])
         sender = header_value(headers, "From").lower()
+        msg_id = thread_message.get("id")
         if own_email not in sender:
+            print(f"[ESCALATION-DEDUP] Message {msg_id}: From={sender!r} — not our mailbox, skipping")
             continue
         body = message_text(thread_message.get("payload", {})).lower()
-        if ESCALATION_NOTICE_PHRASE in body:
+        found = ESCALATION_NOTICE_PHRASE in body
+        print(f"[ESCALATION-DEDUP] Message {msg_id}: From={sender!r} (ours) — escalation phrase found: {found}")
+        if found:
+            print(f"[ESCALATION-DEDUP] Thread {thread_id} — decision: SKIP (already escalated)")
             return True
+
+    print(f"[ESCALATION-DEDUP] Thread {thread_id} — decision: ESCALATE (no prior notice found)")
     return False
 
 
