@@ -102,5 +102,14 @@ GMAIL_REFRESH_TOKEN
 ANTHROPIC_API_KEY
 ESCALATION_EMAIL_1
 CRON_SECRET
+GITHUB_TOKEN
 DRY_RUN=true
 ```
+
+`GITHUB_TOKEN` — the `Softorino_Support_AI` knowledge base repo is private,
+so KB file fetches need a GitHub Personal Access Token (fine-grained,
+read-only `Contents` access to that repo is enough) sent as
+`Authorization: Bearer <token>`. Without it, KB fetches will fail once the
+repo is private — the bot logs a warning and still attempts the request
+unauthenticated for backward compatibility, but it will 404/403 against a
+private repo.

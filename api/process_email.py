@@ -276,7 +276,13 @@ def thread_already_escalated(service, thread_id):
 
 
 def fetch_kb_file(filename):
-    request = UrlRequest(KB_BASE_URL + filename, headers={"User-Agent": "Softorino-Email-Bot"})
+    headers = {"User-Agent": "Softorino-Email-Bot"}
+    github_token = os.getenv("GITHUB_TOKEN")
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    else:
+        print("[KB] WARNING: GITHUB_TOKEN is not set — fetching KB files without authentication.")
+    request = UrlRequest(KB_BASE_URL + filename, headers=headers)
     with urlopen(request, timeout=10) as response:
         return response.read().decode("utf-8")
 
