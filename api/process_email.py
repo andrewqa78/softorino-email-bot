@@ -1,6 +1,7 @@
 """Vercel entry point for the Softorino support email bot."""
 
 import base64
+import hmac
 import json
 import os
 import re
@@ -709,6 +710,10 @@ class handler(BaseHTTPRequestHandler):
         self._process_request()
 
     def _process_request(self):
+        if not self._is_authorized():
+            print("[AUTH] Rejected request — missing or invalid Authorization header.")
+            self._write_json(401, {"error": "Unauthorized"})
+            return
         try:
             response = process_unread_emails()
             self._write_json(200, response)
@@ -717,6 +722,15 @@ class handler(BaseHTTPRequestHandler):
                 500,
                 {"processed": False, "error": f"Gmail processing failed: {error}"},
             )
+
+    def _is_authorized(self):
+        cron_secret = os.getenv("CRON_SECRET")
+        if not cron_secret:
+            print("[AUTH] WARNING: CRON_SECRET is not set — allowing request without authentication.")
+            return True
+        expected = f"Bearer {cron_secret}"
+        provided = self.headers.get("Authorization", "")
+        return hmac.compare_digest(provided, expected)
 
     def _write_json(self, status_code, payload):
         response = json.dumps(payload).encode("utf-8")

@@ -70,6 +70,28 @@ Send a `GET` or `POST` request to `/api/process_email` to run the processing
 flow — for example `curl -s -X POST .../api/process_email` for manual
 testing, or let Vercel Cron trigger it on schedule via GET.
 
+## Endpoint authentication
+
+The endpoint checks every request for `Authorization: Bearer <CRON_SECRET>`.
+If `CRON_SECRET` is set in the environment and the header is missing or
+doesn't match, the endpoint returns `401 {"error": "Unauthorized"}` without
+touching the mailbox or calling Claude. If `CRON_SECRET` is not set, the
+endpoint logs a warning and allows the request (only meant as a transition
+period — set it before relying on this in production).
+
+To configure it:
+
+1. Generate a random secret, e.g. `openssl rand -hex 32`.
+2. Add it to the Vercel project as environment variable `CRON_SECRET`.
+3. Vercel automatically sends this same value as the `Authorization: Bearer`
+   header on every Cron-triggered request to your project, so scheduled runs
+   need no extra setup once the env var is set.
+4. For manual/curl testing, add the header yourself:
+   ```bash
+   curl -s -X POST https://your-deployment.vercel.app/api/process_email \
+     -H "Authorization: Bearer $CRON_SECRET"
+   ```
+
 Required Vercel environment variables:
 
 ```text
@@ -79,5 +101,6 @@ GMAIL_CLIENT_SECRET
 GMAIL_REFRESH_TOKEN
 ANTHROPIC_API_KEY
 ESCALATION_EMAIL_1
+CRON_SECRET
 DRY_RUN=true
 ```
