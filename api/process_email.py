@@ -582,9 +582,60 @@ def deliver_reply(service, draft_message, thread_id, dry_run):
     return {"mode": "sent", "id": sent["id"]}
 
 
+AI_LABEL_NAMES = {
+    "processing": "AI_PROCESSING",
+    "replied": "AI_REPLIED",
+    "escalated": "AI_ESCALATED",
+    "failed": "AI_FAILED",
+}
+
+
+def ensure_labels(service):
+    """Ensure the AI_* state-tracking labels exist; return {key: label_id}."""
+    existing = service.users().labels().list(userId="me").execute().get("labels", [])
+    existing_by_name = {label["name"]: label["id"] for label in existing}
+
+    label_ids = {}
+    for key, name in AI_LABEL_NAMES.items():
+        label_id = existing_by_name.get(name)
+        if not label_id:
+            print(f"[LABELS] Creating missing label: {name}")
+            created = (
+                service.users()
+                .labels()
+                .create(
+                    userId="me",
+                    body={
+                        "name": name,
+                        "labelListVisibility": "labelShow",
+                        "messageListVisibility": "show",
+                    },
+                )
+                .execute()
+            )
+            label_id = created["id"]
+        label_ids[key] = label_id
+    return label_ids
+
+
+def _finalize_message_labels(service, message_id, label_ids, add_label_key, remove_unread=True):
+    """Swap AI_PROCESSING for the given final state label in one API call
+    (and clear UNREAD at the same time, unless told not to)."""
+    remove_ids = [label_ids["processing"]]
+    if remove_unread:
+        remove_ids.append("UNREAD")
+    add_ids = [label_ids[add_label_key]] if add_label_key else []
+    service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"removeLabelIds": remove_ids, "addLabelIds": add_ids},
+    ).execute()
+
+
 def process_unread_emails():
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     service = gmail_service()
+    label_ids = ensure_labels(service)
     result = (
         service.users()
         .messages()
@@ -609,15 +660,40 @@ def process_unread_emails():
             .get(userId="me", id=message_ref["id"], format="full")
             .execute()
         )
+
+        existing_label_ids = set(message.get("labelIds", []))
+        if label_ids["replied"] in existing_label_ids or label_ids["escalated"] in existing_label_ids:
+            print(f"[LABELS] Message {message['id']} already has AI_REPLIED/AI_ESCALATED — skipping.")
+            results.append({"processed": False, "message": "Already handled (AI_REPLIED/AI_ESCALATED label present). Skipped."})
+            continue
+
+        service.users().messages().modify(
+            userId="me",
+            id=message["id"],
+            body={"addLabelIds": [label_ids["processing"]]},
+        ).execute()
+
         try:
-            results.append(process_single_message(service, message, dry_run))
+            results.append(process_single_message(service, message, dry_run, label_ids))
         except Exception as error:
+            print(f"[LABELS] Message {message['id']} FAILED: {error}")
+            try:
+                service.users().messages().modify(
+                    userId="me",
+                    id=message["id"],
+                    body={
+                        "removeLabelIds": [label_ids["processing"]],
+                        "addLabelIds": [label_ids["failed"]],
+                    },
+                ).execute()
+            except Exception as label_error:
+                print(f"[LABELS] Could not set AI_FAILED label: {label_error}")
             results.append({"processed": False, "error": str(error)})
 
     return {"processed_count": len(results), "results": results}
 
 
-def process_single_message(service, message, dry_run):
+def process_single_message(service, message, dry_run, label_ids):
     headers = message.get("payload", {}).get("headers", [])
     sender = header_value(headers, "Reply-To") or header_value(headers, "From")
     subject = header_value(headers, "Subject") or "(no subject)"
@@ -636,21 +712,13 @@ def process_single_message(service, message, dry_run):
 
     # Check for auto-reply/bounce-back
     if is_auto_reply(subject, sender):
-        service.users().messages().modify(
-            userId="me",
-            id=message["id"],
-            body={"removeLabelIds": ["UNREAD"]},
-        ).execute()
+        _finalize_message_labels(service, message["id"], label_ids, add_label_key=None)
         return {"processed": False, "message": "Auto-reply or bounce-back detected. Skipped."}
 
     # Check for sensitive content (threats/legal language)
     if detect_sensitive_content(latest_message, subject):
         escalation_result = escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE")
-        service.users().messages().modify(
-            userId="me",
-            id=message["id"],
-            body={"removeLabelIds": ["UNREAD"]},
-        ).execute()
+        _finalize_message_labels(service, message["id"], label_ids, "escalated")
         return {
             "processed": False,
             "message": "Sensitive content detected. Escalated without auto-reply.",
@@ -662,11 +730,7 @@ def process_single_message(service, message, dry_run):
     if escalation_check["should_escalate"]:
         knowledge_base, kb_files = build_knowledge_base(email_content)
         escalation_result = escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
-        service.users().messages().modify(
-            userId="me",
-            id=message["id"],
-            body={"removeLabelIds": ["UNREAD"]},
-        ).execute()
+        _finalize_message_labels(service, message["id"], label_ids, "escalated")
         return {
             "processed": False,
             "message": "Escalation trigger detected. Escalated to ops team.",
@@ -707,11 +771,7 @@ def process_single_message(service, message, dry_run):
             draft_message["References"] = f"{references} {message_id}".strip()
         draft_message.set_content(reply)
         delivery = deliver_reply(service, draft_message, message.get("threadId"), dry_run)
-        service.users().messages().modify(
-            userId="me",
-            id=message["id"],
-            body={"removeLabelIds": ["UNREAD"]},
-        ).execute()
+        _finalize_message_labels(service, message["id"], label_ids, "escalated")
         return {
             "processed": True,
             "subject": subject,
@@ -731,11 +791,7 @@ def process_single_message(service, message, dry_run):
         draft_message["References"] = f"{references} {message_id}".strip()
     draft_message.set_content(reply)
     delivery = deliver_reply(service, draft_message, message.get("threadId"), dry_run)
-    service.users().messages().modify(
-        userId="me",
-        id=message["id"],
-        body={"removeLabelIds": ["UNREAD"]},
-    ).execute()
+    _finalize_message_labels(service, message["id"], label_ids, "replied")
 
     return {
         "processed": True,

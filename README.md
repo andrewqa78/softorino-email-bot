@@ -61,6 +61,20 @@ up to 5 unread inbox emails per run (1 second delay between each):
 
 Retry logic: Claude API retries once after 3-second delay if request fails. If both attempts fail, email remains unread for next Cron run.
 
+## Gmail label-based state tracking
+
+The bot creates and manages 4 Gmail labels to track processing state per
+message and avoid duplicate customer replies across runs (e.g. if a run
+crashes after sending a reply but before marking the email read):
+
+- `AI_PROCESSING` — added the moment a message starts processing, removed once it reaches a final state
+- `AI_REPLIED` — set once a reply has been successfully delivered to the customer with no escalation
+- `AI_ESCALATED` — set once the ticket has been escalated (with or without an accompanying customer reply)
+- `AI_FAILED` — set if processing raises an error; the email is left unread so the next run retries it
+
+Any message that already carries `AI_REPLIED` or `AI_ESCALATED` is skipped
+entirely on future runs, even if it somehow reappears as unread.
+
 **Escalation priorities:**
 - `[SENSITIVE]` — Threats, legal language, or abuse (no auto-reply sent)
 - `[HIGH PRIORITY]` — Fraud or scam reports (escalate to ops immediately)
