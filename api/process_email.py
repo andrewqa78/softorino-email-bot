@@ -699,18 +699,16 @@ def process_single_message(service, message, dry_run):
 
 
 class handler(BaseHTTPRequestHandler):
-    """Process one support email request.
-
-    Implementation will be added in the next setup step.
-    """
+    """Process unread support emails. Triggered by manual POST (curl/testing)
+    or GET (Vercel Cron, which calls scheduled endpoints with GET)."""
 
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Softorino email bot is ready.")
+        self._process_request()
 
     def do_POST(self):
+        self._process_request()
+
+    def _process_request(self):
         try:
             response = process_unread_emails()
             self._write_json(200, response)

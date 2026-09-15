@@ -44,8 +44,10 @@ softorino-email-bot/
 └── README.md
 ```
 
-The current POST endpoint processes up to 5 unread inbox emails per run
-(1 second delay between each):
+The endpoint accepts both GET and POST (Vercel Cron calls scheduled
+endpoints with GET, manual/curl testing typically uses POST — both run
+the same processing and return the same JSON response) and processes
+up to 5 unread inbox emails per run (1 second delay between each):
 
 1. **Filter at fetch time** — Gmail query only returns mail from the last 7 days, and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
 2. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
@@ -64,9 +66,9 @@ Retry logic: Claude API retries once after 3-second delay if request fails. If b
 - `[HIGH PRIORITY]` — Fraud or scam reports (escalate to ops immediately)
 - `[ESCALATION]` — Billing/refund/cancellation requests, unknown topics, payment failures
 
-Send a `POST` request to `/api/process_email` to run the test flow. A `GET`
-request only checks that the function is available and does not expose the
-configured mailbox address.
+Send a `GET` or `POST` request to `/api/process_email` to run the processing
+flow — for example `curl -s -X POST .../api/process_email` for manual
+testing, or let Vercel Cron trigger it on schedule via GET.
 
 Required Vercel environment variables:
 
