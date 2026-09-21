@@ -7,11 +7,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
 TOKEN_FILE = Path(__file__).with_name("token.json")
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.send",
-]
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 
 def main() -> None:
