@@ -1,0 +1,38 @@
+name: Check KB routing
+
+# The knowledge base lives in a separate repo, so drift can be introduced from
+# either side: renaming a file here breaks on push, renaming one there breaks
+# without this repo changing at all. Hence the daily run as well as push/PR.
+on:
+  push:
+    paths:
+      - "api/process_email.py"
+      - "scripts/check_kb_routing.py"
+      - ".github/workflows/check-kb-routing.yml"
+  pull_request:
+    paths:
+      - "api/process_email.py"
+      - "scripts/check_kb_routing.py"
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No dependencies to install -- the script is stdlib only and reads the
+      # routing map with ast rather than importing the bot.
+      - name: Compare routing map against knowledge_base/
+        env:
+          # A PAT with read access to the private Softorino_Support_AI repo.
+          # The default GITHUB_TOKEN is scoped to this repo only and cannot
+          # read another private one.
+          GITHUB_TOKEN: ${{ secrets.KB_GITHUB_TOKEN }}
+        run: python scripts/check_kb_routing.py
