@@ -317,9 +317,14 @@ def relevant_kb_files(email_content):
         "syc_pro.md": ("syc", "youtube converter"),
         "alttunes.md": ("alttunes",),
         "iringg.md": ("iringg",),
+        "beamer.md": ("beamer",),
+        "softorino_convert.md": ("softorino convert",),
         "activation_and_license.md": ("activation", "license", "subscription", "dashboard"),
         "Softorino_Billing_and_Payments.md": ("refund", "charge", "billing", "payment", "cancel"),
-        "other_products.md": ("beamer", "folder colorizer", "picfindr", "cleanappsnow"),
+        "other_products.md": (
+            "folder colorizer", "picfindr", "cleanappsnow",
+            "volume concierge", "memory optimizer", "task forcequit",
+        ),
     }
     for filename, keywords in routing.items():
         if any(re.search(rf"\b{re.escape(keyword)}\b", content) for keyword in keywords):
