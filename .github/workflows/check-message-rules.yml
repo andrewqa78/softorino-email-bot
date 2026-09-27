@@ -1,0 +1,31 @@
+name: Check message rules
+
+# Unlike the KB routing check, everything these tests touch lives in this repo,
+# so push and pull_request are enough -- there is no third-party state that can
+# drift on its own, and no daily run is needed.
+on:
+  push:
+    paths:
+      - "api/process_email.py"
+      - "scripts/check_message_rules.py"
+      - ".github/workflows/check-message-rules.yml"
+  pull_request:
+    paths:
+      - "api/process_email.py"
+      - "scripts/check_message_rules.py"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No dependencies and no secrets: the script stubs the bot's third-party
+      # imports and only exercises pure rule functions.
+      - name: Escalation triggers and quote stripping
+        run: python scripts/check_message_rules.py

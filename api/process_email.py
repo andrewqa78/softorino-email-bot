@@ -165,6 +165,44 @@ QUOTE_BOUNDARY_PATTERNS = [
 ]
 
 
+# Gmail writes the attribution line in the UI language of the sender, so
+# matching on "wrote:" only ever covers English. What every client's line does
+# carry is the quoted sender's address in angle brackets. Requiring a digit or a
+# trailing colon as well keeps a customer's own closing line ("write me at
+# <me@example.com>") out of the net -- attribution lines always carry a
+# timestamp and almost always end in a colon.
+QUOTED_ADDRESS_PATTERN = re.compile(r"<[^<>@\s]+@[^<>@\s]+>")
+ATTRIBUTION_TAIL_LINES = 3
+
+
+def _strip_attribution_tail(latest):
+    """Drop a trailing quote-attribution line the language-specific patterns missed.
+
+    Returns (kept_text, removed_text). Returns the text untouched if stripping
+    would empty it -- a one-line message is not an attribution line.
+    """
+    lines = latest.splitlines()
+    cut = None
+    scanned = 0
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if not line.strip():
+            continue
+        if scanned >= ATTRIBUTION_TAIL_LINES:
+            break
+        scanned += 1
+        if not QUOTED_ADDRESS_PATTERN.search(line):
+            continue
+        if line.rstrip().endswith(":") or any(char.isdigit() for char in line):
+            cut = index
+    if cut is None:
+        return latest, ""
+    kept = "\n".join(lines[:cut]).strip()
+    if not kept:
+        return latest, ""
+    return kept, "\n".join(lines[cut:]).strip()
+
+
 def split_latest_message(text):
     """Split an email body into (latest reply, quoted thread history).
 
@@ -180,6 +218,11 @@ def split_latest_message(text):
             cut_at = min(cut_at, match.start())
     latest = text[:cut_at].strip()
     older = text[cut_at:].strip()
+    # Second pass: the patterns above are English-only, so a Ukrainian/Spanish/
+    # German client leaves its attribution line sitting in the "new" text.
+    latest, attribution = _strip_attribution_tail(latest)
+    if attribution:
+        older = "\n".join(part for part in (attribution, older) if part).strip()
     return (latest or text.strip()), older
 
 
@@ -362,23 +405,36 @@ def detect_escalation_triggers(email_content):
     """Detect HARD escalation triggers only: fraud and explicit help refusal."""
     content = email_content.lower()
 
-    # Fraud/scam detection (HIGH PRIORITY) - always escalate
-    fraud_keywords = ["scam", "fraud", "you scammed", "you lied", "stolen"]
-    for keyword in fraud_keywords:
-        if keyword in content:
+    # Fraud/scam detection (HIGH PRIORITY) - always escalate.
+    # Word-bounded like detect_sensitive_content(): a bare substring test lets a
+    # trigger hide inside an unrelated word, which is how "no support" used to
+    # match "Softori[no Suppor]t Team". The \w* tail keeps scam/scams/scammed
+    # and fraud/fraudulent matching.
+    fraud_patterns = [
+        r"\bscam\w*\b", r"\bfraud\w*\b", r"\byou scammed\b",
+        r"\byou lied\b", r"\bstolen\b",
+    ]
+    for pattern in fraud_patterns:
+        if re.search(pattern, content):
             return {"should_escalate": True, "reason": "Fraud/Scam Report", "priority": "HIGH PRIORITY"}
 
     # Explicit refusal to accept help - customer wants ONLY refund/cancellation, not troubleshooting
+    # "no support" was removed on purpose: it matched inside our own name
+    # ("Softori[no Suppor]t Team"), so every "Hello Softorino Support" and every
+    # quoted bot signature escalated before Claude was ever called, and the
+    # customer got no reply at all. A genuine refusal still hits "don't want
+    # support" / "don't want help".
+    # The gaps are bounded because ".*" spans paragraphs: "i just want to know
+    # ... your refund policy" is a question, not a refusal.
     hard_refusal_patterns = [
-        r"just refund",
-        r"only refund",
-        r"don't want help",
-        r"don't want support",
-        r"no troubleshooting",
-        r"no support",
-        r"skip the help",
-        r"i just want.*refund",
-        r"please cancel.*no.*help",
+        r"\bjust refund\b",
+        r"\bonly refund\b",
+        r"\bdon't want help\b",
+        r"\bdon't want support\b",
+        r"\bno troubleshooting\b",
+        r"\bskip the help\b",
+        r"\bi just want\b.{0,60}?\brefund\b",
+        r"\bplease cancel\b.{0,60}?\bno\b.{0,60}?\bhelp\b",
     ]
     for pattern in hard_refusal_patterns:
         if re.search(pattern, content):

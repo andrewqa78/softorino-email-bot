@@ -40,9 +40,11 @@ softorino-email-bot/
 ├── api/
 │   └── process_email.py
 ├── scripts/
-│   └── check_kb_routing.py
+│   ├── check_kb_routing.py
+│   └── check_message_rules.py
 ├── .github/workflows/
-│   └── check-kb-routing.yml
+│   ├── check-kb-routing.yml
+│   └── check-message-rules.yml
 ├── requirements.txt
 ├── vercel.json
 └── README.md
@@ -107,6 +109,37 @@ fails on the GitHub lookup.
 
 **When you add a KB file,** add a route for it in `relevant_kb_files()` in the
 same change.
+
+## Message rule regression tests
+
+`detect_escalation_triggers()` and `split_latest_message()` run before Claude is
+called, so a false positive in either one means the customer gets no reply at
+all. The run still reports success and the ticket just becomes an escalation,
+which makes these failures easy to miss in production.
+
+Both have already shipped that bug. `detect_escalation_triggers()` matched
+`no support` as a plain substring, so it fired inside our own company name --
+`Softori[no Suppor]t Team`. Every "Hello Softorino Support" and every quoted bot
+signature escalated as a refund refusal. `split_latest_message()` only knew
+English quote markers, so a Gmail account with a non-English interface left its
+attribution line, company name included, inside the customer's new message and
+fed the first bug.
+
+`scripts/check_message_rules.py` covers both:
+
+```bash
+python scripts/check_message_rules.py
+```
+
+It stubs the bot's third-party imports and only calls pure rule functions, so it
+needs no dependencies, no credentials and no network.
+
+`.github/workflows/check-message-rules.yml` runs it on push and pull request. No
+daily run here -- everything it tests lives in this repo, so nothing can drift
+without a commit.
+
+**When you add or widen a trigger pattern,** add a case for it. Word boundaries
+matter: bare substrings are what caused both bugs.
 
 ## Gmail label-based state tracking
 
