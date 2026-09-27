@@ -57,8 +57,8 @@ up to 5 unread inbox emails per run (1 second delay between each):
 
 1. **Filter at fetch time** — Gmail query only returns mail from the last 7 days, and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
 2. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
-3. **Detect sensitive content** — Escalates without auto-reply if email contains threats, legal language, or severe insults
-4. **Check escalation triggers** — Escalates if customer mentions refunds, charges, cancellations, fraud, or payment providers (PayPal, FastSpring, etc.)
+3. **Detect sensitive content** — Threats, legal language or severe insults escalate to the ops team and the customer gets a fixed template (`SENSITIVE_ESCALATION_REPLY`), never a generated reply
+4. **Check escalation triggers** — Refunds, charges, cancellations, fraud or payment providers escalate to the ops team, and the customer still gets a reply generated from the escalation template for the matching category
 5. **Generate AI reply** — Fetches relevant KB files and sends email + KB to Claude API
 6. **Validate Claude response** — If Claude returns fallback answer ("our team will review"), escalates to ops team
 7. **Create draft reply** — Saves reply as a Gmail draft (never auto-sends in draft-only mode)
@@ -66,6 +66,27 @@ up to 5 unread inbox emails per run (1 second delay between each):
 9. **Return status** — JSON response with `processed_count` and a `results` array (one entry per email) with draft ID, escalation reason (if any), and KB files used
 
 Retry logic: Claude API retries once after 3-second delay if request fails. If both attempts fail, email remains unread for next Cron run.
+
+## Escalation categories
+
+Every escalation reply is written from a template in `tone_of_voice.md`, picked
+by category. The code decides only which category applies and passes it to
+Claude; the wording lives in the knowledge base so it can change without a
+deploy.
+
+| Category | Picked when |
+|---|---|
+| `billing` | `Refund Request (Customer Refuses Help)`, `Unauthorized Charge` |
+| `general` | `Fraud/Scam Report`, Claude's no-answer fallback, anything unmapped |
+| `account`, `technical` | Claude names them in its own `[[ESCALATE: ...]]` reason |
+
+Sensitive content is the one case with no generated text at all. It answers with
+`SENSITIVE_ESCALATION_REPLY`, a fixed constant in `api/process_email.py`.
+
+Duplicate ops notifications are suppressed by checking whether any message in
+the thread carries the `AI_ESCALATED` label. That check used to grep message
+bodies for one fixed English sentence, which stopped working once the wording
+became per-category and per-language.
 
 ## Keeping KB routing in sync
 

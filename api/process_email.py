@@ -69,6 +69,31 @@ THREAD_CONTEXT_CHAR_LIMIT = 6000
 SENDER_NAME_CHAR_LIMIT = 100
 SENDER_EMAIL_CHAR_LIMIT = 200
 
+# tone_of_voice.md holds one escalation template per category. The code only
+# reports which category applies, so the wording can be changed in the knowledge
+# base without a deploy.
+ESCALATION_CATEGORIES = ("billing", "account", "technical", "general")
+DEFAULT_ESCALATION_CATEGORY = "general"
+RULE_ESCALATION_CATEGORIES = {
+    "Refund Request (Customer Refuses Help)": "billing",
+    "Unauthorized Charge": "billing",
+    "Fraud/Scam Report": "general",
+}
+
+# Threats and legal language do not get a generated reply -- but silence is
+# worse: an angry customer who hears nothing back opens a payment dispute. This
+# fixed template says only that the message arrived and a person has it. No
+# department names, no timeframe, no apology, no read on the situation.
+SENSITIVE_ESCALATION_REPLY = """Hi there,
+
+Thank you for your message. We have received it and passed it to our team.
+
+Someone will be in touch with you.
+
+Best Regards,
+Sofi
+Softorino Support Team"""
+
 
 def strip_html(text):
     """Best-effort HTML tag stripping — defense-in-depth against injected
@@ -245,77 +270,26 @@ def extract_escalation_marker(reply):
     return clean_reply, reason
 
 
-ESCALATION_NOTICE_PHRASE = "forwarded your case to our support team"
-ESCALATION_NOTICE_SENTENCE = (
-    "We have forwarded your case to our support team for further review."
-)
-# tone_of_voice.md section 8 ends every reply with a three-line sign-off
-# ("Best Regards," / agent name / "Softorino Support Team").
-SIGNATURE_LINE_PATTERN = re.compile(r"^[ \t]*best regards,", re.IGNORECASE | re.MULTILINE)
+def thread_already_escalated(service, thread_id, escalated_label_id):
+    """Report whether any message in the thread already carries AI_ESCALATED.
 
-
-def ensure_escalation_notice(reply):
-    """Guarantee the canonical escalation phrase appears in the customer reply.
-
-    Claude's own KB-approved phrasing varies ("I've forwarded this to our
-    billing team", etc.), which is too unreliable to search for later. Adding
-    this exact, fixed sentence whenever we escalate lets thread_already_escalated()
-    detect "we already escalated this thread" deterministically.
-
-    The sentence goes directly above the sign-off block so the email does not
-    end with a stray line dangling underneath the signature. Replies with no
-    recognisable sign-off line keep the old behaviour and get it appended.
+    This used to grep message bodies for one fixed English sentence. Escalation
+    wording now comes from tone_of_voice.md and differs per category and per
+    language, so there is no sentence left to search for. The label is written
+    by _finalize_message_labels() on every escalation path and does not depend
+    on wording at all.
     """
-    if ESCALATION_NOTICE_PHRASE in reply.lower():
-        return reply
-    match = SIGNATURE_LINE_PATTERN.search(reply)
-    if not match:
-        return f"{reply}\n\n{ESCALATION_NOTICE_SENTENCE}"
-    head = reply[: match.start()].rstrip()
-    tail = reply[match.start() :]
-    if not head:
-        return f"{ESCALATION_NOTICE_SENTENCE}\n\n{tail}"
-    return f"{head}\n\n{ESCALATION_NOTICE_SENTENCE}\n\n{tail}"
-
-
-def _own_mailbox_address(service):
-    """Resolve the authenticated mailbox's own address.
-
-    Prefer Gmail's own profile over the GMAIL_USER_EMAIL env var: if that
-    env var ever drifts from the actual OAuth account (typo, different
-    case, alias), a From-header comparison against it would silently never
-    match and the dedup check below would always say "not escalated yet".
-    """
-    env_value = (os.getenv("GMAIL_USER_EMAIL") or "").strip().lower()
-    profile_email = ""
-    try:
-        profile = service.users().getProfile(userId="me").execute()
-        profile_email = (profile.get("emailAddress") or "").strip().lower()
-    except Exception as error:
-        print(f"[ESCALATION-DEDUP] Could not fetch Gmail profile address: {error}")
-    own_email = profile_email or env_value
-    print(
-        f"[ESCALATION-DEDUP] own mailbox address resolved to {own_email!r} "
-        f"(profile={profile_email!r}, env GMAIL_USER_EMAIL={env_value!r})"
-    )
-    return own_email
-
-
-def thread_already_escalated(service, thread_id):
-    """Check the thread for a prior reply that already notified the customer
-    of an escalation, so we don't notify ops again for the same open case."""
     print(f"[ESCALATION-DEDUP] Checking thread_id={thread_id!r}")
     if not thread_id:
         print("[ESCALATION-DEDUP] No thread_id — decision: ESCALATE (cannot check history)")
         return False
-
-    own_email = _own_mailbox_address(service)
-    if not own_email:
-        print("[ESCALATION-DEDUP] Could not resolve own mailbox address — decision: ESCALATE")
+    if not escalated_label_id:
+        print("[ESCALATION-DEDUP] No AI_ESCALATED label id — decision: ESCALATE")
         return False
 
     try:
-        thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        # "minimal" still returns labelIds and skips the message bodies.
+        thread = service.users().threads().get(userId="me", id=thread_id, format="minimal").execute()
     except Exception as error:
         print(f"[ESCALATION-DEDUP] FAILED to read thread {thread_id}: {error} — decision: ESCALATE")
         return False
@@ -324,20 +298,15 @@ def thread_already_escalated(service, thread_id):
     print(f"[ESCALATION-DEDUP] Thread {thread_id}: found {len(thread_messages)} message(s)")
 
     for thread_message in thread_messages:
-        headers = thread_message.get("payload", {}).get("headers", [])
-        sender = header_value(headers, "From").lower()
         msg_id = thread_message.get("id")
-        if own_email not in sender:
-            print(f"[ESCALATION-DEDUP] Message {msg_id}: From={sender!r} — not our mailbox, skipping")
-            continue
-        body = message_text(thread_message.get("payload", {})).lower()
-        found = ESCALATION_NOTICE_PHRASE in body
-        print(f"[ESCALATION-DEDUP] Message {msg_id}: From={sender!r} (ours) — escalation phrase found: {found}")
-        if found:
+        message_labels = thread_message.get("labelIds", [])
+        if escalated_label_id in message_labels:
+            print(f"[ESCALATION-DEDUP] Message {msg_id} carries AI_ESCALATED")
             print(f"[ESCALATION-DEDUP] Thread {thread_id} — decision: SKIP (already escalated)")
             return True
+        print(f"[ESCALATION-DEDUP] Message {msg_id}: labels={message_labels} — no AI_ESCALATED")
 
-    print(f"[ESCALATION-DEDUP] Thread {thread_id} — decision: ESCALATE (no prior notice found)")
+    print(f"[ESCALATION-DEDUP] Thread {thread_id} — decision: ESCALATE (no prior escalation label)")
     return False
 
 
@@ -427,6 +396,25 @@ def normalize_punctuation(text):
     return text.translate(PUNCTUATION_NORMALIZATION)
 
 
+def category_for_escalation_reason(reason):
+    """Map an escalation reason to one of ESCALATION_CATEGORIES.
+
+    Rule-based reasons come from a fixed table. Claude's marker reason is free
+    text, so it is only scanned for a category it named itself; anything else
+    falls back to "general".
+    """
+    if not reason:
+        return DEFAULT_ESCALATION_CATEGORY
+    mapped = RULE_ESCALATION_CATEGORIES.get(reason)
+    if mapped:
+        return mapped
+    lowered = reason.lower()
+    for category in ESCALATION_CATEGORIES:
+        if re.search(rf"\b{category}\b", lowered):
+            return category
+    return DEFAULT_ESCALATION_CATEGORY
+
+
 def detect_escalation_triggers(email_content):
     """Detect HARD escalation triggers only: fraud and explicit help refusal."""
     content = normalize_punctuation(email_content).lower()
@@ -502,6 +490,7 @@ def generate_reply(
     thread_context="",
     sender_display_name="",
     sender_email="",
+    escalation_category="",
     max_retries=2,
 ):
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -602,7 +591,10 @@ Knowledge base:
         "Customer display name from the email header (may be empty): "
         f"{sender_display_name or '(empty — no display name in the header)'}\n"
         f"Customer email address: {sender_email or '(unknown)'}\n"
-        f"Customer email subject: {subject}\n\n"
+        f"Customer email subject: {subject}\n"
+        "Escalation category (empty when this is a normal reply; when set, use "
+        "the matching escalation template from tone_of_voice.md and do not "
+        f"include troubleshooting steps): {escalation_category or '(none)'}\n\n"
     )
     if thread_context:
         user_content += (
@@ -833,12 +825,32 @@ def process_unread_emails():
     return {"processed_count": len(results), "results": results}
 
 
+def _deliver_customer_reply(service, message, sender, subject, reply, dry_run):
+    """Build the reply email, keep it threaded, and hand it to deliver_reply().
+
+    Factored out because four code paths now answer the customer: a normal
+    reply, a Claude-flagged escalation, a rule-triggered escalation and the
+    fixed sensitive-content template.
+    """
+    headers = message.get("payload", {}).get("headers", [])
+    message_id = header_value(headers, "Message-ID")
+    references = header_value(headers, "References")
+    draft_message = EmailMessage()
+    draft_message["To"] = parseaddr(sender)[1] or sender
+    draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    if message_id:
+        draft_message["In-Reply-To"] = message_id
+        draft_message["References"] = f"{references} {message_id}".strip()
+    draft_message.set_content(reply)
+    return deliver_reply(service, draft_message, message.get("threadId"), dry_run)
+
+
 def process_single_message(service, message, dry_run, label_ids):
     headers = message.get("payload", {}).get("headers", [])
     sender = header_value(headers, "Reply-To") or header_value(headers, "From")
     subject = header_value(headers, "Subject") or "(no subject)"
-    message_id = header_value(headers, "Message-ID")
-    references = header_value(headers, "References")
+    # Message-ID/References are read by _deliver_customer_reply() from the same
+    # headers, so they are not pulled out here any more.
     email_content = message_text(message.get("payload", {}))[:MAX_EMAIL_CHARS]
     if not sender:
         raise RuntimeError("Unread email does not contain a sender address.")
@@ -855,26 +867,54 @@ def process_single_message(service, message, dry_run, label_ids):
         _finalize_message_labels(service, message["id"], label_ids, add_label_key=None)
         return {"processed": False, "message": "Auto-reply or bounce-back detected. Skipped."}
 
-    # Check for sensitive content (threats/legal language)
+    # Check for sensitive content (threats/legal language). Deliberately never
+    # reaches Claude: generated text has no place in a reply to a threat or a
+    # legal notice. The customer still hears back, from a fixed template.
     if detect_sensitive_content(latest_message, subject):
         escalation_result = escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE")
+        delivery = _deliver_customer_reply(
+            service, message, sender, subject, SENSITIVE_ESCALATION_REPLY, dry_run
+        )
         _finalize_message_labels(service, message["id"], label_ids, "escalated")
         return {
-            "processed": False,
-            "message": "Sensitive content detected. Escalated without auto-reply.",
+            "processed": True,
+            "subject": subject,
+            "delivery": delivery,
+            "message": "Sensitive content detected. Fixed template sent, escalated.",
+            "escalated": True,
+            "escalation_reason": "SENSITIVE: Threats or legal language detected",
             "escalation": escalation_result,
         }
 
     # Check for escalation triggers
     escalation_check = detect_escalation_triggers(latest_message)
     if escalation_check["should_escalate"]:
+        # The customer gets an answer here too. Returning silently is what made
+        # a refund demand look ignored, which is how payment disputes start.
         knowledge_base, kb_files = build_knowledge_base(email_content)
         escalation_result = escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
+        sender_display_name, sender_email = parseaddr(sender)
+        category = category_for_escalation_reason(escalation_check["reason"])
+        raw_reply = generate_reply(
+            latest_message,
+            subject,
+            knowledge_base,
+            thread_context,
+            sender_display_name=sender_display_name,
+            sender_email=sender_email or sender,
+            escalation_category=category,
+        )
+        reply, _marker_reason = extract_escalation_marker(raw_reply)
+        delivery = _deliver_customer_reply(service, message, sender, subject, reply, dry_run)
         _finalize_message_labels(service, message["id"], label_ids, "escalated")
         return {
-            "processed": False,
-            "message": "Escalation trigger detected. Escalated to ops team.",
+            "processed": True,
+            "subject": subject,
+            "delivery": delivery,
+            "message": "Escalation trigger detected. Replied and escalated to ops team.",
+            "escalated": True,
             "escalation_reason": escalation_check["reason"],
+            "escalation_category": category,
             "knowledge_base_files": kb_files,
             "escalation": escalation_result,
         }
@@ -898,7 +938,7 @@ def process_single_message(service, message, dry_run, label_ids):
     if marker_reason or is_fallback_reply:
         escalation_reason = marker_reason or "Claude fallback: No KB answer found"
         thread_id = message.get("threadId")
-        if thread_already_escalated(service, thread_id):
+        if thread_already_escalated(service, thread_id, label_ids.get("escalated")):
             print(f"[ESCALATION] Thread {thread_id} was already escalated earlier — skipping duplicate ops notification.")
             escalation_result = {
                 "escalated": False,
@@ -909,16 +949,9 @@ def process_single_message(service, message, dry_run, label_ids):
             }
         else:
             escalation_result = escalate_email(service, sender, subject, email_content, escalation_reason, priority="NORMAL")
-            reply = ensure_escalation_notice(reply)
-        # Still send/draft the customer-facing reply
-        draft_message = EmailMessage()
-        draft_message["To"] = parseaddr(sender)[1] or sender
-        draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-        if message_id:
-            draft_message["In-Reply-To"] = message_id
-            draft_message["References"] = f"{references} {message_id}".strip()
-        draft_message.set_content(reply)
-        delivery = deliver_reply(service, draft_message, message.get("threadId"), dry_run)
+        # Still send/draft the customer-facing reply. Claude already wrote it
+        # from the KB escalation template, so nothing is appended to it here.
+        delivery = _deliver_customer_reply(service, message, sender, subject, reply, dry_run)
         _finalize_message_labels(service, message["id"], label_ids, "escalated")
         return {
             "processed": True,
@@ -927,18 +960,12 @@ def process_single_message(service, message, dry_run, label_ids):
             "knowledge_base_files": kb_files,
             "escalated": True,
             "escalation_reason": escalation_reason,
+            "escalation_category": category_for_escalation_reason(marker_reason),
             "escalation": escalation_result,
         }
 
     # Deliver reply (draft in DRY_RUN, sent live otherwise)
-    draft_message = EmailMessage()
-    draft_message["To"] = parseaddr(sender)[1] or sender
-    draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-    if message_id:
-        draft_message["In-Reply-To"] = message_id
-        draft_message["References"] = f"{references} {message_id}".strip()
-    draft_message.set_content(reply)
-    delivery = deliver_reply(service, draft_message, message.get("threadId"), dry_run)
+    delivery = _deliver_customer_reply(service, message, sender, subject, reply, dry_run)
     _finalize_message_labels(service, message["id"], label_ids, "replied")
 
     return {

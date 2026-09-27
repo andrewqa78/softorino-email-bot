@@ -29,6 +29,8 @@ Usage::
     python scripts/check_message_rules.py
 """
 
+import contextlib
+import io
 import sys
 import types
 from pathlib import Path
@@ -213,6 +215,158 @@ def check_sensitive():
     return failures
 
 
+# --- escalation category routing -------------------------------------------
+# The reply wording lives in tone_of_voice.md, one template per category. The
+# code only reports the category, so a wrong mapping here means a billing
+# escalation answered with a generic template.
+# (label, reason, expected category)
+CATEGORY_CASES = [
+    ("refund refusal routes to billing", "Refund Request (Customer Refuses Help)", "billing"),
+    ("unauthorized charge routes to billing", "Unauthorized Charge", "billing"),
+    ("fraud report routes to general", "Fraud/Scam Report", "general"),
+    ("claude fallback routes to general", "Claude fallback: No KB answer found", "general"),
+    ("unknown reason falls back to general", "something nobody mapped", "general"),
+    ("empty reason falls back to general", "", "general"),
+    # Claude's marker reason is free text and may name the category itself.
+    ("marker naming technical is honoured", "Known bug, technical team needed", "technical"),
+    ("marker naming account is honoured", "Needs account record access", "account"),
+]
+
+
+def check_categories():
+    failures = []
+    for label, reason, expected in CATEGORY_CASES:
+        actual = bot.category_for_escalation_reason(reason)
+        if actual == expected:
+            print(f"  ok    {label}")
+            continue
+        print(
+            f"  FAIL  {label}\n"
+            f"        reason {reason!r}: expected {expected!r}, got {actual!r}"
+        )
+        failures.append(label)
+    return failures
+
+
+# --- escalation dedup -------------------------------------------------------
+ESCALATED_LABEL_ID = "Label_77"
+
+# The phrase the old body-grep implementation looked for. A thread carrying it
+# in the text but no label must NOT count as escalated -- otherwise the removed
+# behaviour is still deciding things.
+OLD_PHRASE_BODY = "We have forwarded your case to our support team for further review."
+
+
+class FakeThreads:
+    """Minimal stand-in for service.users().threads()."""
+
+    def __init__(self, thread):
+        self._thread = thread
+
+    def get(self, **kwargs):
+        thread = self._thread
+        return types.SimpleNamespace(execute=lambda: thread)
+
+
+class FakeUsers:
+    def __init__(self, thread):
+        self._threads = FakeThreads(thread)
+
+    def threads(self):
+        return self._threads
+
+
+class FakeService:
+    def __init__(self, thread):
+        self._users = FakeUsers(thread)
+
+    def users(self):
+        return self._users
+
+
+def _thread_with(messages):
+    return {"messages": messages}
+
+
+def _text_message(msg_id, body, label_ids):
+    """A thread message shaped the way the Gmail API returns it."""
+    import base64
+
+    encoded = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii")
+    return {
+        "id": msg_id,
+        "labelIds": label_ids,
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [{"name": "From", "value": "support@softorino.app"}],
+            "body": {"data": encoded},
+        },
+    }
+
+
+DEDUP_CASES = [
+    (
+        "thread with AI_ESCALATED is already escalated",
+        _thread_with([
+            _text_message("m1", "Hi there", ["INBOX"]),
+            _text_message("m2", "Some reply", ["SENT", ESCALATED_LABEL_ID]),
+        ]),
+        True,
+    ),
+    (
+        "thread without AI_ESCALATED is not escalated",
+        _thread_with([
+            _text_message("m1", "Hi there", ["INBOX"]),
+            _text_message("m2", "Some reply", ["SENT"]),
+        ]),
+        False,
+    ),
+    (
+        "old phrase in the body without the label does not count",
+        _thread_with([
+            _text_message("m1", OLD_PHRASE_BODY, ["SENT"]),
+        ]),
+        False,
+    ),
+    (
+        "empty thread is not escalated",
+        _thread_with([]),
+        False,
+    ),
+]
+
+
+def _quiet(call):
+    """Run a bot function with its [ESCALATION-DEDUP] logging swallowed."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        return call()
+
+
+def check_dedup():
+    failures = []
+    for label, thread, expected in DEDUP_CASES:
+        service = FakeService(thread)
+        actual = _quiet(lambda: bot.thread_already_escalated(service, "t1", ESCALATED_LABEL_ID))
+        if actual == expected:
+            print(f"  ok    {label}")
+            continue
+        print(f"  FAIL  {label}\n        expected {expected}, got {actual}")
+        failures.append(label)
+
+    # Degenerate inputs must fail open (escalate), never silently skip.
+    for label, thread_id, label_id in [
+        ("missing thread id escalates", None, ESCALATED_LABEL_ID),
+        ("missing label id escalates", "t1", None),
+    ]:
+        service = FakeService(_thread_with([]))
+        if _quiet(lambda: bot.thread_already_escalated(service, thread_id, label_id)) is False:
+            print(f"  ok    {label}")
+        else:
+            print(f"  FAIL  {label}")
+            failures.append(label)
+    return failures
+
+
 def check_escalations():
     failures = []
     for label, text, expected in ESCALATION_CASES:
@@ -284,13 +438,26 @@ def check_quote_stripping():
 def main():
     print("Escalation triggers:")
     failures = check_escalations()
+    print("\nEscalation categories:")
+    failures += check_categories()
+
+    print("\nEscalation dedup (label based):")
+    failures += check_dedup()
+
     print("\nSensitive content:")
     failures += check_sensitive()
 
     print("\nQuote stripping:")
     failures += check_quote_stripping()
 
-    total = len(ESCALATION_CASES) + len(SENSITIVE_CASES) + 5
+    total = (
+        len(ESCALATION_CASES)
+        + len(CATEGORY_CASES)
+        + len(DEDUP_CASES)
+        + 2  # degenerate dedup inputs
+        + len(SENSITIVE_CASES)
+        + 5  # quote stripping
+    )
     if failures:
         print(f"\n{len(failures)} of {total} checks failed.")
         return 1
