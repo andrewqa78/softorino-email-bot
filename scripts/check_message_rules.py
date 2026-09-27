@@ -13,6 +13,10 @@ of them have already shipped a bug that silently swallowed real support mail:
   with a non-English interface left its attribution line -- company name and all
   -- inside the text treated as the customer's new message, feeding the bug
   above.
+* The trigger patterns are written in plain ASCII, but iOS and Apple Mail turn
+  ``'`` into ``’`` as you type and most of our customers write from those. A
+  real refusal worded "I don’t want support" matched nothing at all, so the
+  customer got an autoreply instead of a human.
 
 Both classes of failure are invisible in production: the run reports success and
 the ticket just quietly becomes an escalation. Hence these tests.
@@ -114,6 +118,29 @@ ESCALATION_CASES = [
     ("fraud report escalates", "This is a scam, give me my money", True),
     ("'scammed' still matches", "You scammed me out of 40 dollars", True),
     ("'fraudulent' still matches", "This charge is fraudulent", True),
+    # Smart punctuation: each pair is the same sentence typed on a keyboard and
+    # typed on an iPhone. They have to behave identically.
+    (
+        "refusal with straight apostrophe escalates",
+        "I don't want support, just a refund",
+        True,
+    ),
+    (
+        "refusal with curly apostrophe escalates",
+        "I don’t want support, just a refund",
+        True,
+    ),
+    (
+        "unauthorized charge with curly apostrophe escalates",
+        "I didn’t authorize this charge",
+        True,
+    ),
+    (
+        "technical email with a curly apostrophe does not escalate",
+        "WALTR PRO won’t start on my Mac — it quits right after I open it. "
+        "I’ve already reinstalled it twice.",
+        False,
+    ),
     (
         "ordinary technical email does not escalate",
         "Hi, WALTR PRO crashes immediately on launch on Windows 11. "
@@ -149,6 +176,41 @@ Hi Andrew, please reinstall iTunes.
 CUSTOMER_ADDRESS_EMAIL = """My app still crashes.
 
 You can also reach me at <andrew.other@example.com>"""
+
+
+# (label, email text, subject, expected_sensitive)
+SENSITIVE_CASES = [
+    ("threat with straight apostrophe", "I'll sue you", "", True),
+    ("threat with curly apostrophe", "I’ll sue you", "", True),
+    # "sue you" matches with or without the apostrophe. This pair is the one
+    # that actually depended on it: the only route to True here is the
+    # "i(?:'ll| will) kill" pattern.
+    ("'i'll kill' with straight apostrophe", "I'll kill him", "", True),
+    ("'i'll kill' with curly apostrophe", "I’ll kill him", "", True),
+    ("threat with curly apostrophe in subject", "see subject", "I’ll sue you", True),
+    (
+        "technical email with a curly apostrophe is not sensitive",
+        "WALTR PRO won’t start and I can’t work out why.",
+        "Won’t launch",
+        False,
+    ),
+]
+
+
+def check_sensitive():
+    failures = []
+    for label, text, subject, expected in SENSITIVE_CASES:
+        actual = bot.detect_sensitive_content(text, subject)
+        if actual == expected:
+            print(f"  ok    {label}")
+            continue
+        print(
+            f"  FAIL  {label}\n"
+            f"        expected sensitive={expected}, got {actual}\n"
+            f"        text: {text[:90]!r} subject: {subject[:60]!r}"
+        )
+        failures.append(label)
+    return failures
 
 
 def check_escalations():
@@ -222,10 +284,13 @@ def check_quote_stripping():
 def main():
     print("Escalation triggers:")
     failures = check_escalations()
+    print("\nSensitive content:")
+    failures += check_sensitive()
+
     print("\nQuote stripping:")
     failures += check_quote_stripping()
 
-    total = len(ESCALATION_CASES) + 5
+    total = len(ESCALATION_CASES) + len(SENSITIVE_CASES) + 5
     if failures:
         print(f"\n{len(failures)} of {total} checks failed.")
         return 1

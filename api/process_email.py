@@ -401,9 +401,35 @@ def is_auto_reply(subject, sender):
     return False
 
 
+# Smart punctuation is on by default in iOS and Apple Mail, and most of our
+# customers write from those, so a curly apostrophe is the norm in incoming mail
+# rather than the exception. The trigger patterns are written in plain ASCII, so
+# without this "I don’t want support" simply never matches "don't want support"
+# -- a real refusal misses escalation and the customer gets an autoreply instead
+# of a human. Dashes are folded too, so a future multi-word pattern cannot be
+# broken the same way.
+PUNCTUATION_NORMALIZATION = str.maketrans(
+    {
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+        "\u2012": "-", "\u2013": "-", "\u2014": "-",
+    }
+)
+
+
+def normalize_punctuation(text):
+    """Fold smart quotes and dashes to their ASCII equivalents.
+
+    Used only by the rule checks below. Text on its way to Claude keeps the
+    customer's own punctuation -- it is harmless there, and there is no reason
+    to rewrite what someone wrote.
+    """
+    return text.translate(PUNCTUATION_NORMALIZATION)
+
+
 def detect_escalation_triggers(email_content):
     """Detect HARD escalation triggers only: fraud and explicit help refusal."""
-    content = email_content.lower()
+    content = normalize_punctuation(email_content).lower()
 
     # Fraud/scam detection (HIGH PRIORITY) - always escalate.
     # Word-bounded like detect_sensitive_content(): a bare substring test lets a
@@ -456,7 +482,7 @@ def detect_sensitive_content(email_content, subject):
     flagged normal words like "issue" (contains "sue") and "courtesy"
     (contains "court") as sensitive.
     """
-    combined = (email_content + " " + subject).lower()
+    combined = normalize_punctuation(email_content + " " + subject).lower()
     sensitive_patterns = [
         r"\blawyer\b", r"\battorney\b", r"\bsue you\b", r"\blawsuit\b",
         r"\blegal action\b", r"\bpress charges\b", r"\bcourt\b",
