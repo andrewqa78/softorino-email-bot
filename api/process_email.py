@@ -25,9 +25,17 @@ KB_BASE_URL = (
 )
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_EMAIL_CHARS = 30000
-TEST_SENDER_EMAIL = "andrewsupport78@gmail.com"
 
-MAX_EMAILS_PER_RUN = 5
+# Which senders the bot is allowed to answer, read from the environment so the
+# blast radius can be changed in Vercel without a deploy. "all" lifts the filter
+# entirely; a comma-separated list restricts it to those addresses.
+ALLOWED_SENDERS_ENV = "ALLOWED_SENDERS"
+ALLOWED_SENDERS_ALL = "all"
+
+# One run handles at most this many emails. ~70 mails a day arrive in working
+# hours rather than evenly, so 5 was short at peak. Each email takes 15-20s and
+# the platform kills the function at 300s, so 10 is about as high as this goes.
+MAX_EMAILS_PER_RUN = 10
 PROCESS_WINDOW_DAYS = 7
 DELAY_BETWEEN_EMAILS_SECONDS = 1
 EXCLUDED_SENDER_TERMS = ["noreply", "no-reply", "mailer-daemon"]
@@ -37,12 +45,38 @@ EXCLUDED_SUBJECT_TERMS = [
 ]
 
 
-def build_unread_query():
+def allowed_senders():
+    """Parse ALLOWED_SENDERS into the sender allow-list.
+
+    Returns a list of addresses to restrict to, an empty list for "all" (no
+    filter), or None when the variable is missing, blank or holds nothing but
+    separators.
+
+    None means "process nothing". That is deliberate: the alternative reading of
+    an unset variable is "no filter", and someone deleting the variable by
+    accident would then mail every customer in the inbox. A bot that goes quiet
+    shows up in the run history within the hour; sent email does not come back.
+    """
+    raw = (os.getenv(ALLOWED_SENDERS_ENV) or "").strip().lower()
+    if not raw:
+        return None
+    if raw == ALLOWED_SENDERS_ALL:
+        return []
+    addresses = [part.strip() for part in raw.split(",")]
+    addresses = [address for address in addresses if address]
+    # e.g. ALLOWED_SENDERS=" , , " -- separators but no address. Fail closed
+    # rather than falling through to an unfiltered query.
+    return addresses or None
+
+
+def build_unread_query(senders):
     terms = [
         "in:inbox", "is:unread", "-in:spam", "-in:trash",
         f"newer_than:{PROCESS_WINDOW_DAYS}d",
-        f"from:{TEST_SENDER_EMAIL}",
     ]
+    if senders:
+        # Gmail groups alternatives with parentheses: from:(a@x.com OR b@y.com).
+        terms.append("from:({})".format(" OR ".join(senders)))
     terms += [f"-from:{term}" for term in EXCLUDED_SENDER_TERMS]
     terms += [f'-subject:"{term}"' for term in EXCLUDED_SUBJECT_TERMS]
     return " ".join(terms)
@@ -765,6 +799,23 @@ def _finalize_message_labels(service, message_id, label_ids, add_label_key, remo
 
 
 def process_unread_emails():
+    senders = allowed_senders()
+    if senders is None:
+        print(
+            f"[SAFETY] {ALLOWED_SENDERS_ENV} is not set or is empty — processing NOTHING. "
+            f"Set it to a comma-separated list of addresses to restrict the bot, "
+            f'or to "{ALLOWED_SENDERS_ALL}" to answer every sender.'
+        )
+        return {
+            "processed_count": 0,
+            "results": [],
+            "message": f"{ALLOWED_SENDERS_ENV} is not set — no email processed.",
+        }
+    if senders:
+        print(f"[SAFETY] Restricted to senders: {', '.join(senders)}")
+    else:
+        print(f'[SAFETY] {ALLOWED_SENDERS_ENV}="{ALLOWED_SENDERS_ALL}" — answering every sender.')
+
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     service = gmail_service()
     label_ids = ensure_labels(service)
@@ -773,7 +824,7 @@ def process_unread_emails():
         .messages()
         .list(
             userId="me",
-            q=build_unread_query(),
+            q=build_unread_query(senders),
             maxResults=MAX_EMAILS_PER_RUN,
         )
         .execute()

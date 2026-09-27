@@ -44,7 +44,8 @@ softorino-email-bot/
 │   └── check_message_rules.py
 ├── .github/workflows/
 │   ├── check-kb-routing.yml
-│   └── check-message-rules.yml
+│   ├── check-message-rules.yml
+│   └── run-bot.yml
 ├── requirements.txt
 ├── vercel.json
 └── README.md
@@ -53,7 +54,7 @@ softorino-email-bot/
 The endpoint accepts both GET and POST (Vercel Cron calls scheduled
 endpoints with GET, manual/curl testing typically uses POST — both run
 the same processing and return the same JSON response) and processes
-up to 5 unread inbox emails per run (1 second delay between each):
+up to 10 unread inbox emails per run (1 second delay between each):
 
 1. **Filter at fetch time** — Gmail query only returns mail from the last 7 days, and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
 2. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
@@ -216,9 +217,43 @@ To configure it:
      -H "Authorization: Bearer $CRON_SECRET"
    ```
 
+## Who the bot is allowed to answer
+
+`ALLOWED_SENDERS` decides whose mail the bot even sees. It is read on every run,
+so the blast radius changes in the Vercel dashboard without a deploy.
+
+| Value | Effect |
+|---|---|
+| `andrewsupport78@gmail.com` | only that address -- the test setup |
+| `a@example.com,b@example.com` | only those addresses |
+| `all` | no sender filter -- live mode, every customer |
+| missing, blank, or only commas | **processes nothing** and logs a `[SAFETY]` warning |
+
+Values are trimmed and lowercased, and several addresses become
+`from:(a@x.com OR b@y.com)` in the Gmail query.
+
+The last row is deliberate. The other reading of an unset variable is "no
+filter", and deleting the variable by accident would then mail every customer in
+the inbox. A bot that goes quiet is visible in the run history within the hour;
+sent email is not recoverable. The check runs before the mailbox is opened.
+
+## Scheduled runs
+
+Vercel Cron on the Hobby plan allows one run a day and fails the deployment on a
+more frequent expression, so `vercel.json` has no `crons` section. The schedule
+lives in `.github/workflows/run-bot.yml` instead: every 30 minutes, plus
+`workflow_dispatch` for a manual run from the Actions tab. It POSTs to the
+endpoint with `Authorization: Bearer`, so it needs a repository secret named
+`CRON_SECRET` holding the same value as the Vercel environment variable.
+
+Do not shorten the interval. Runs are billed rounded up to the whole minute
+against 2000 free minutes a month on a private repo. Every 30 minutes is ~1440;
+every 20 would be ~2160 and would run out before the month ends.
+
 Required Vercel environment variables:
 
 ```text
+ALLOWED_SENDERS
 GMAIL_USER_EMAIL
 GMAIL_CLIENT_ID
 GMAIL_CLIENT_SECRET
@@ -229,6 +264,8 @@ CRON_SECRET
 GITHUB_TOKEN
 DRY_RUN=true
 ```
+
+`ALLOWED_SENDERS` — see above. Without it the bot processes nothing.
 
 `GITHUB_TOKEN` — the `Softorino_Support_AI` knowledge base repo is private,
 so KB file fetches need a GitHub Personal Access Token (fine-grained,

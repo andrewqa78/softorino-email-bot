@@ -685,6 +685,126 @@ def check_end_to_end():
     return failures
 
 
+# --- sender allow-list ------------------------------------------------------
+# ALLOWED_SENDERS is the only thing standing between a test run and 600+ real
+# customers. The two cases that matter most are the ones where the variable is
+# missing or blank: the bot has to go quiet, because the other reading of an
+# unset variable is "no filter" and that mails everyone.
+
+TEST_SENDER = "andrewsupport78@gmail.com"
+
+
+@contextlib.contextmanager
+def allowed_senders_env(value):
+    """Set ALLOWED_SENDERS to a value, or remove it when value is None."""
+    previous = os.environ.get("ALLOWED_SENDERS")
+    if value is None:
+        os.environ.pop("ALLOWED_SENDERS", None)
+    else:
+        os.environ["ALLOWED_SENDERS"] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("ALLOWED_SENDERS", None)
+        else:
+            os.environ["ALLOWED_SENDERS"] = previous
+
+
+def check_allowed_senders():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    def query_for(value):
+        with allowed_senders_env(value):
+            return bot.build_unread_query(bot.allowed_senders())
+
+    # One address.
+    query = query_for(TEST_SENDER)
+    expect(
+        "single address is filtered on",
+        f"from:({TEST_SENDER})" in query,
+        f"query={query!r}",
+    )
+
+    # Several addresses.
+    query = query_for(f"{TEST_SENDER},someone@example.com")
+    expect(
+        "both addresses appear in the query",
+        TEST_SENDER in query and "someone@example.com" in query and " OR " in query,
+        f"query={query!r}",
+    )
+
+    # Whitespace and casing.
+    query = query_for(f"  {TEST_SENDER.upper()} , Someone@Example.COM  ")
+    expect(
+        "addresses are trimmed and lowercased",
+        f"from:({TEST_SENDER} OR someone@example.com)" in query,
+        f"query={query!r}",
+    )
+
+    # "all" lifts the filter.
+    query = query_for("all")
+    expect(
+        '"all" adds no from: filter',
+        "from:(" not in query,
+        f"query={query!r}",
+    )
+    expect(
+        '"all" still filters the rest of the query',
+        "in:inbox" in query and "is:unread" in query,
+        f"query={query!r}",
+    )
+    query = query_for("  ALL  ")
+    expect('"ALL" with padding is also recognised', "from:(" not in query, f"query={query!r}")
+
+    # -- the safety catch --
+    with allowed_senders_env(None):
+        expect("missing variable parses as None", bot.allowed_senders() is None)
+    with allowed_senders_env(""):
+        expect("empty variable parses as None", bot.allowed_senders() is None)
+    with allowed_senders_env("   "):
+        expect("whitespace-only variable parses as None", bot.allowed_senders() is None)
+    with allowed_senders_env(" , , "):
+        expect("separators without addresses parse as None", bot.allowed_senders() is None)
+
+    # process_unread_emails() must bail out before it ever builds a service.
+    class ExplodingService:
+        def __getattr__(self, name):
+            raise AssertionError(
+                "process_unread_emails touched the mailbox with ALLOWED_SENDERS unset"
+            )
+
+    original_service = bot.gmail_service
+    bot.gmail_service = lambda: ExplodingService()
+    try:
+        for label, value in [
+            ("missing variable processes nothing", None),
+            ("empty variable processes nothing", ""),
+        ]:
+            with allowed_senders_env(value):
+                try:
+                    result = _quiet(bot.process_unread_emails)
+                except AssertionError as error:
+                    expect(label, False, str(error))
+                    continue
+            expect(
+                label,
+                result.get("processed_count") == 0 and result.get("results") == [],
+                f"result={result!r}",
+            )
+    finally:
+        bot.gmail_service = original_service
+
+    return failures
+
+
 def main():
     print("Escalation triggers:")
     failures = check_escalations()
@@ -696,6 +816,9 @@ def main():
 
     print("\nSensitive content:")
     failures += check_sensitive()
+
+    print("\nSender allow-list (ALLOWED_SENDERS):")
+    failures += check_allowed_senders()
 
     print("\nEnd to end (process_single_message):")
     failures += check_end_to_end()
@@ -709,6 +832,7 @@ def main():
         + len(DEDUP_CASES)
         + 2  # degenerate dedup inputs
         + len(SENSITIVE_CASES)
+        + 12  # sender allow-list
         + 13  # end to end
         + 5  # quote stripping
     )

@@ -1,0 +1,48 @@
+name: Run bot
+
+# Vercel Cron on the Hobby plan allows one run a day, and a more frequent
+# expression fails the deployment, so the schedule lives here instead. The
+# endpoint is a normal authenticated POST, so anything that can hold a secret
+# can drive it.
+#
+# Every run is billed rounded up to a whole minute against the 2000 free
+# minutes a month on a private repo. Every 30 minutes is ~1440 a month. Every
+# 20 would be ~2160 and would run out before month end -- do not raise this.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # A hung request would otherwise keep burning billed minutes until the
+    # 6 hour default.
+    timeout-minutes: 5
+    steps:
+      - name: Trigger email processing
+        env:
+          # Never interpolated into the command line, so it cannot reach the log
+          # through a traced command. No -v, no printing the request.
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set +e
+          # --fail-with-body: non-zero exit on 4xx/5xx, but still print the body,
+          # so a failed run is red in the history instead of a green no-op.
+          response=$(curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --max-time 280 \
+            --request POST \
+            --header "Authorization: Bearer $CRON_SECRET" \
+            https://softorino-email-bot-green.vercel.app/api/process_email)
+          status=$?
+          set -e
+
+          echo "$response"
+
+          if [ $status -ne 0 ]; then
+            echo "::error::Bot request failed (curl exit $status)"
+            exit $status
+          fi
