@@ -88,6 +88,10 @@ the thread carries the `AI_ESCALATED` label. That check used to grep message
 bodies for one fixed English sentence, which stopped working once the wording
 became per-category and per-language.
 
+The customer is answered every time. Only the notification to the team is
+deduplicated -- three "just refund me" messages in a row get three replies and
+one page.
+
 ## Keeping KB routing in sync
 
 `relevant_kb_files()` picks knowledge base files from a hardcoded map. The files
@@ -146,7 +150,12 @@ English quote markers, so a Gmail account with a non-English interface left its
 attribution line, company name included, inside the customer's new message and
 fed the first bug.
 
-`scripts/check_message_rules.py` covers both:
+`scripts/check_message_rules.py` covers both, plus the escalation category
+mapping, the label-based dedup, and an end-to-end run of
+`process_single_message()` against a fake Gmail service. That last group is the
+one worth keeping: it checks whether the customer is answered at all, whether
+the team is paged, and which label the message ends up carrying -- none of which
+a single-function test can see.
 
 ```bash
 python scripts/check_message_rules.py

@@ -892,7 +892,21 @@ def process_single_message(service, message, dry_run, label_ids):
         # The customer gets an answer here too. Returning silently is what made
         # a refund demand look ignored, which is how payment disputes start.
         knowledge_base, kb_files = build_knowledge_base(email_content)
-        escalation_result = escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
+        # The reply always goes out; the ops notification only the first time.
+        # Now that this path keeps the conversation going, three "just refund
+        # me" messages in a row would otherwise page the team three times.
+        thread_id = message.get("threadId")
+        if thread_already_escalated(service, thread_id, label_ids.get("escalated")):
+            print(f"[ESCALATION] Thread {thread_id} was already escalated earlier — skipping duplicate ops notification.")
+            escalation_result = {
+                "escalated": False,
+                "recipients": [],
+                "reason": escalation_check["reason"],
+                "priority": escalation_check["priority"],
+                "skipped_duplicate": True,
+            }
+        else:
+            escalation_result = escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
         sender_display_name, sender_email = parseaddr(sender)
         category = category_for_escalation_reason(escalation_check["reason"])
         raw_reply = generate_reply(

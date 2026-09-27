@@ -29,13 +29,45 @@ Usage::
     python scripts/check_message_rules.py
 """
 
+import base64
 import contextlib
 import io
+import os
 import sys
 import types
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# Records every Claude call so the end-to-end checks can assert on what the
+# prompt carried -- and, for sensitive content, that Claude was never called.
+CLAUDE_CALLS = []
+
+CLAUDE_STUB_REPLY = (
+    "Hi Andrew,\n\nYour request is now with the team.\n\n"
+    "Best Regards,\nSofi\nSoftorino Support Team"
+)
+
+
+class _StubBlock:
+    type = "text"
+    text = CLAUDE_STUB_REPLY
+
+
+class _StubResponse:
+    content = [_StubBlock()]
+
+
+class _StubMessages:
+    def create(self, **kwargs):
+        CLAUDE_CALLS.append(kwargs)
+        return _StubResponse()
+
+
+class FakeAnthropic:
+    def __init__(self, api_key=None):
+        self.messages = _StubMessages()
 
 
 def load_bot_module():
@@ -61,7 +93,7 @@ def load_bot_module():
     sys.modules["google.auth.transport.requests"].Request = object
     sys.modules["google.oauth2.credentials"].Credentials = object
     sys.modules["googleapiclient.discovery"].build = lambda *a, **k: None
-    sys.modules["anthropic"].Anthropic = object
+    sys.modules["anthropic"].Anthropic = FakeAnthropic
 
     sys.path.insert(0, str(REPO_ROOT / "api"))
     import process_email
@@ -435,6 +467,224 @@ def check_quote_stripping():
     return failures
 
 
+# --- end to end --------------------------------------------------------------
+# The checks above test one function at a time. This group runs
+# process_single_message() itself, which is where the expensive mistakes live:
+# whether the customer is answered at all, whether ops is notified, and which
+# label the message ends up with. A unit test cannot see any of that.
+
+LABEL_IDS = {"processing": "L1", "replied": "L2", "escalated": "L3", "failed": "L4"}
+ESCALATED_LABEL = LABEL_IDS["escalated"]
+
+
+class _Call:
+    def __init__(self, value):
+        self.value = value
+
+    def execute(self):
+        return self.value
+
+
+class FakeGmailService:
+    """Enough of the Gmail API to run process_single_message() end to end.
+
+    Records every drafts().create, messages().send and messages().modify so the
+    checks can tell a customer reply from an ops notification.
+    """
+
+    def __init__(self, thread=None):
+        self.actions = []
+        self._thread = thread or {"messages": []}
+
+    # -- api surface --
+    def users(self):
+        return self
+
+    def drafts(self):
+        return self
+
+    def messages(self):
+        return self
+
+    def threads(self):
+        return self
+
+    def create(self, userId=None, body=None):
+        self.actions.append(("draft", body["message"]))
+        return _Call({"id": "draft-1"})
+
+    def send(self, userId=None, body=None):
+        self.actions.append(("send", body))
+        return _Call({"id": "sent-1"})
+
+    def modify(self, userId=None, id=None, body=None):
+        self.actions.append(("modify", body))
+        return _Call({})
+
+    def get(self, userId=None, id=None, format=None):
+        return _Call(self._thread)
+
+    # -- assertions helpers --
+    def customer_reply(self):
+        """The reply to the customer: the draft, in DRY_RUN."""
+        for kind, body in self.actions:
+            if kind == "draft":
+                return base64.urlsafe_b64decode(body["raw"]).decode("utf-8")
+        return None
+
+    def ops_notification(self):
+        """escalate_email() sends to ops through messages().send()."""
+        for kind, body in self.actions:
+            if kind == "send":
+                return base64.urlsafe_b64decode(body["raw"]).decode("utf-8")
+        return None
+
+    def added_labels(self):
+        for entry in self.actions:
+            if entry[0] == "modify":
+                return entry[1].get("addLabelIds", [])
+        return []
+
+
+def _incoming(body, subject="Refund"):
+    raw = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii")
+    return {
+        "id": "msg-1",
+        "threadId": "t1",
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [
+                {"name": "From", "value": "Andrew Q <andrew@example.com>"},
+                {"name": "Subject", "value": subject},
+                {"name": "Message-ID", "value": "<abc@mail>"},
+            ],
+            "body": {"data": raw},
+        },
+    }
+
+
+def _escalated_thread():
+    return {"messages": [{"id": "old", "labelIds": ["SENT", ESCALATED_LABEL]}]}
+
+
+def _run_message(body, subject="Refund", thread=None):
+    service = FakeGmailService(thread)
+    CLAUDE_CALLS.clear()
+    result = _quiet(
+        lambda: bot.process_single_message(service, _incoming(body, subject), True, LABEL_IDS)
+    )
+    return service, result
+
+
+def _category_line():
+    """The escalation-category line out of the last prompt sent to Claude."""
+    content = CLAUDE_CALLS[0]["messages"][0]["content"]
+    for line in content.splitlines():
+        if line.startswith("Escalation category"):
+            return line
+    return ""
+
+
+def check_end_to_end():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    # The bot must not reach GitHub for the knowledge base during tests.
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+
+    try:
+        # 1. Rule escalation: the silence bug. Reply AND notification AND label.
+        service, result = _run_message("Just refund me, I don't want troubleshooting")
+        expect(
+            "rule escalation replies to the customer",
+            result.get("processed") is True and service.customer_reply() is not None,
+            f"processed={result.get('processed')}, reply={service.customer_reply()!r}",
+        )
+        expect(
+            "rule escalation notifies ops",
+            service.ops_notification() is not None,
+        )
+        expect(
+            "rule escalation labels the message AI_ESCALATED",
+            service.added_labels() == [ESCALATED_LABEL],
+            f"added={service.added_labels()}",
+        )
+        expect(
+            "rule escalation passes the billing category to Claude",
+            result.get("escalation_category") == "billing" and "billing" in _category_line(),
+            f"category={result.get('escalation_category')!r}, line={_category_line()!r}",
+        )
+
+        # 2. Already-escalated thread: still reply, do not page ops again.
+        service, result = _run_message(
+            "Just refund me, I don't want troubleshooting", thread=_escalated_thread()
+        )
+        expect(
+            "repeat escalation still replies to the customer",
+            service.customer_reply() is not None,
+        )
+        expect(
+            "repeat escalation does not notify ops twice",
+            service.ops_notification() is None
+            and result["escalation"].get("skipped_duplicate") is True,
+            f"ops={service.ops_notification()!r}, escalation={result.get('escalation')}",
+        )
+
+        # 3. Sensitive content: fixed template, Claude never called.
+        service, result = _run_message("I'll sue you, I am calling my lawyer")
+        reply = service.customer_reply() or ""
+        expect(
+            "sensitive content sends the fixed template",
+            bot.SENSITIVE_ESCALATION_REPLY.strip() in reply,
+            f"reply={reply!r}",
+        )
+        expect(
+            "sensitive content never reaches Claude",
+            not CLAUDE_CALLS,
+            f"{len(CLAUDE_CALLS)} call(s) made",
+        )
+        expect(
+            "sensitive content notifies ops",
+            service.ops_notification() is not None,
+        )
+
+        # 4. The ordinary path must still behave.
+        service, result = _run_message(
+            "WALTR PRO will not start on Windows 11", subject="Crash"
+        )
+        expect(
+            "normal reply is delivered",
+            result.get("processed") is True and service.customer_reply() is not None,
+        )
+        expect(
+            "normal reply is labelled AI_REPLIED",
+            service.added_labels() == [LABEL_IDS["replied"]],
+            f"added={service.added_labels()}",
+        )
+        expect(
+            "normal reply carries no escalation category",
+            "(none)" in _category_line(),
+            f"line={_category_line()!r}",
+        )
+        expect(
+            "normal reply does not notify ops",
+            service.ops_notification() is None,
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
 def main():
     print("Escalation triggers:")
     failures = check_escalations()
@@ -447,6 +697,9 @@ def main():
     print("\nSensitive content:")
     failures += check_sensitive()
 
+    print("\nEnd to end (process_single_message):")
+    failures += check_end_to_end()
+
     print("\nQuote stripping:")
     failures += check_quote_stripping()
 
@@ -456,6 +709,7 @@ def main():
         + len(DEDUP_CASES)
         + 2  # degenerate dedup inputs
         + len(SENSITIVE_CASES)
+        + 13  # end to end
         + 5  # quote stripping
     )
     if failures:
