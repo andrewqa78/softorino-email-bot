@@ -54,7 +54,7 @@ softorino-email-bot/
 The endpoint accepts both GET and POST (Vercel Cron calls scheduled
 endpoints with GET, manual/curl testing typically uses POST — both run
 the same processing and return the same JSON response) and processes
-up to 10 unread inbox emails per run (1 second delay between each):
+up to 10 unread **threads** per run (1 second delay between each):
 
 1. **Filter at fetch time** — Gmail query only returns mail from the last 7 days, and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
 2. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
@@ -67,6 +67,34 @@ up to 10 unread inbox emails per run (1 second delay between each):
 9. **Return status** — JSON response with `processed_count` and a `results` array (one entry per email) with draft ID, escalation reason (if any), and KB files used
 
 Retry logic: Claude API retries once after 3-second delay if request fails. If both attempts fail, email remains unread for next Cron run.
+
+## One reply per thread
+
+Unread messages are grouped by `threadId` and only the newest message of each
+thread is answered. The others are marked read, given the same label as the
+answered message, and never reach Claude. Nothing is lost: the newest message
+quotes the whole conversation underneath it.
+
+Without this, a customer who wrote five times between runs got five separate
+replies in ninety seconds -- and the angrier the customer, the more likely they
+were to write repeatedly. It happened in production.
+
+`MAX_EMAILS_PER_RUN` counts threads, not messages, so one talkative customer can
+no longer eat the run and leave everyone else waiting. The run lists
+`MAX_MESSAGES_SCANNED_PER_RUN` (5x the thread limit) messages before grouping,
+because several of them can collapse into one thread.
+
+Gmail lists newest first, but for a thread with more than one unread message the
+order is confirmed against `internalDate` before picking. Answering the wrong
+message means replying to a stale request while the real one sits unread. Single
+message threads skip that lookup.
+
+The run result reports `skipped_older_in_thread`, so the logs show the grouping
+working rather than leaving it to be inferred.
+
+If processing the newest message fails, its older siblings stay unread on
+purpose -- the next run retries the whole thread instead of losing messages
+behind a label.
 
 ## Escalation categories
 

@@ -805,6 +805,288 @@ def check_allowed_senders():
     return failures
 
 
+# --- thread grouping --------------------------------------------------------
+# One customer writing five times between runs used to get five separate
+# replies in ninety seconds. Only the newest message of a thread is answered
+# now; the rest are labelled and left alone. Getting "newest" wrong means
+# answering a stale request, so the ordering is asserted explicitly.
+
+
+class FakeMailbox:
+    """A Gmail stand-in complete enough to run process_unread_emails().
+
+    Messages are declared as (id, thread_id, internal_date, subject). The list
+    order is the order given, which is deliberately NOT date order in the tests
+    so the internalDate sort has something to prove.
+    """
+
+    def __init__(self, messages):
+        self.store = {}
+        self.refs = []
+        for msg_id, thread_id, internal_date, subject in messages:
+            ref = {"id": msg_id}
+            if thread_id is not None:
+                ref["threadId"] = thread_id
+            self.refs.append(ref)
+            self.store[msg_id] = {
+                "id": msg_id,
+                "threadId": thread_id,
+                "internalDate": str(internal_date),
+                "labelIds": ["INBOX", "UNREAD"],
+                "subject": subject,
+            }
+        self.created_drafts = []
+        self.sent = []
+        self.modifies = []
+        self.list_calls = []
+
+    # -- state helpers used by the checks --
+    def labels_of(self, msg_id):
+        return list(self.store[msg_id]["labelIds"])
+
+    def answered_message_ids(self):
+        """Which message each draft replied to, via In-Reply-To."""
+        answered = []
+        for raw in self.created_drafts:
+            text = base64.urlsafe_b64decode(raw["raw"]).decode("utf-8")
+            for line in text.splitlines():
+                if line.lower().startswith("in-reply-to:"):
+                    answered.append(line.split("<", 1)[1].split("@", 1)[0])
+        return answered
+
+    # -- api surface --
+    def users(self):
+        return self
+
+    def messages(self):
+        return _MailboxMessages(self)
+
+    def drafts(self):
+        return _MailboxDrafts(self)
+
+    def labels(self):
+        return _MailboxLabels(self)
+
+    def threads(self):
+        return _MailboxThreads(self)
+
+
+class _MailboxMessages:
+    def __init__(self, mailbox):
+        self.mb = mailbox
+
+    def list(self, userId=None, q=None, maxResults=None):
+        self.mb.list_calls.append({"q": q, "maxResults": maxResults})
+        return _Call({"messages": self.mb.refs[:maxResults]})
+
+    def get(self, userId=None, id=None, format=None):
+        stored = self.mb.store[id]
+        common = {
+            "id": stored["id"],
+            "threadId": stored["threadId"],
+            "internalDate": stored["internalDate"],
+            "labelIds": list(stored["labelIds"]),
+        }
+        if format == "minimal":
+            return _Call(common)
+        body = base64.urlsafe_b64encode(
+            f"{stored['subject']} body text".encode("utf-8")
+        ).decode("ascii")
+        common["payload"] = {
+            "mimeType": "text/plain",
+            "headers": [
+                {"name": "From", "value": "Angry Customer <angry@example.com>"},
+                {"name": "Subject", "value": stored["subject"]},
+                {"name": "Message-ID", "value": f"<{stored['id']}@mail>"},
+            ],
+            "body": {"data": body},
+        }
+        return _Call(common)
+
+    def modify(self, userId=None, id=None, body=None):
+        self.mb.modifies.append((id, body))
+        labels = self.mb.store[id]["labelIds"]
+        for label in body.get("removeLabelIds", []):
+            if label in labels:
+                labels.remove(label)
+        for label in body.get("addLabelIds", []):
+            if label not in labels:
+                labels.append(label)
+        return _Call({})
+
+    def send(self, userId=None, body=None):
+        self.mb.sent.append(body)
+        return _Call({"id": "sent-1"})
+
+
+class _MailboxDrafts:
+    def __init__(self, mailbox):
+        self.mb = mailbox
+
+    def create(self, userId=None, body=None):
+        self.mb.created_drafts.append(body["message"])
+        return _Call({"id": f"draft-{len(self.mb.created_drafts)}"})
+
+
+class _MailboxLabels:
+    def __init__(self, mailbox):
+        self.mb = mailbox
+
+    def list(self, userId=None):
+        return _Call({"labels": [{"name": name, "id": f"id-{name}"} for name in bot.AI_LABEL_NAMES.values()]})
+
+
+class _MailboxThreads:
+    def __init__(self, mailbox):
+        self.mb = mailbox
+
+    def get(self, userId=None, id=None, format=None):
+        return _Call({"messages": []})
+
+
+@contextlib.contextmanager
+def _run_environment(mailbox):
+    """ALLOWED_SENDERS set, no network, no inter-thread sleep."""
+    original_service = bot.gmail_service
+    original_kb = bot.build_knowledge_base
+    original_delay = bot.DELAY_BETWEEN_EMAILS_SECONDS
+    bot.gmail_service = lambda: mailbox
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.DELAY_BETWEEN_EMAILS_SECONDS = 0
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+    try:
+        with allowed_senders_env("all"):
+            yield
+    finally:
+        bot.gmail_service = original_service
+        bot.build_knowledge_base = original_kb
+        bot.DELAY_BETWEEN_EMAILS_SECONDS = original_delay
+
+
+def _run(mailbox):
+    CLAUDE_CALLS.clear()
+    with _run_environment(mailbox):
+        return _quiet(bot.process_unread_emails)
+
+
+def check_thread_grouping():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    SUBJECT = "Re: your software doesn't work!!!!"
+
+    # 1. Three messages, one thread. List order is oldest-first on purpose, so
+    #    answering the first one would be wrong.
+    mailbox = FakeMailbox([
+        ("m1", "t1", 1000, SUBJECT),
+        ("m2", "t1", 3000, SUBJECT),  # the newest
+        ("m3", "t1", 2000, SUBJECT),
+    ])
+    result = _run(mailbox)
+    expect(
+        "one thread produces exactly one reply",
+        len(mailbox.created_drafts) == 1,
+        f"{len(mailbox.created_drafts)} draft(s)",
+    )
+    expect(
+        "the newest message is the one answered",
+        mailbox.answered_message_ids() == ["m2"],
+        f"answered {mailbox.answered_message_ids()}",
+    )
+    expect(
+        "Claude is called once, not once per message",
+        len(CLAUDE_CALLS) == 1,
+        f"{len(CLAUDE_CALLS)} call(s)",
+    )
+    expect(
+        "the two older messages are counted as folded in",
+        result.get("skipped_older_in_thread") == 2,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+    expect(
+        "older messages get the answered message's label and lose UNREAD",
+        all(
+            "id-AI_REPLIED" in mailbox.labels_of(m) and "UNREAD" not in mailbox.labels_of(m)
+            for m in ("m1", "m3")
+        ),
+        f"m1={mailbox.labels_of('m1')}, m3={mailbox.labels_of('m3')}",
+    )
+    expect(
+        "one result entry, not three",
+        result.get("processed_count") == 1,
+        f"processed_count={result.get('processed_count')}",
+    )
+
+    # 2. Three separate threads behave exactly as before.
+    mailbox = FakeMailbox([
+        ("a1", "ta", 1000, "Crash on launch"),
+        ("b1", "tb", 1000, "Activation question"),
+        ("c1", "tc", 1000, "Transfer question"),
+    ])
+    result = _run(mailbox)
+    expect("three threads produce three replies", len(mailbox.created_drafts) == 3, f"{len(mailbox.created_drafts)}")
+    expect("three threads skip nothing", result.get("skipped_older_in_thread") == 0)
+    expect("three threads give three results", result.get("processed_count") == 3)
+
+    # 3. Mixed: one two-message thread plus two singles.
+    mailbox = FakeMailbox([
+        ("x1", "tx", 1000, "Crash"),
+        ("x2", "tx", 2000, "Crash again"),
+        ("y1", "ty", 1000, "Licence"),
+        ("z1", "tz", 1000, "Transfer"),
+    ])
+    result = _run(mailbox)
+    expect("mixed case produces three replies", len(mailbox.created_drafts) == 3, f"{len(mailbox.created_drafts)}")
+    expect("mixed case folds in one older message", result.get("skipped_older_in_thread") == 1)
+    expect(
+        "mixed case answers the newest of the grouped thread",
+        "x2" in mailbox.answered_message_ids() and "x1" not in mailbox.answered_message_ids(),
+        f"answered {mailbox.answered_message_ids()}",
+    )
+
+    # 4. A ref with no threadId must not merge into anyone else's conversation.
+    mailbox = FakeMailbox([
+        ("n1", None, 1000, "No thread id"),
+        ("n2", None, 2000, "Also no thread id"),
+        ("p1", "tp", 1000, "Normal"),
+    ])
+    result = _run(mailbox)
+    expect(
+        "messages without threadId stay separate",
+        len(mailbox.created_drafts) == 3 and result.get("skipped_older_in_thread") == 0,
+        f"{len(mailbox.created_drafts)} draft(s), skipped={result.get('skipped_older_in_thread')}",
+    )
+
+    # 5. The run must list more messages than the thread limit, or one talkative
+    #    customer starves the rest of the run.
+    expect(
+        "the list call scans past the thread limit",
+        mailbox.list_calls[0]["maxResults"] > bot.MAX_EMAILS_PER_RUN,
+        f"maxResults={mailbox.list_calls[0]['maxResults']}, limit={bot.MAX_EMAILS_PER_RUN}",
+    )
+
+    # 6. Thread count, not message count, is what the limit caps.
+    many = []
+    for index in range(bot.MAX_EMAILS_PER_RUN + 3):
+        many.append((f"g{index}", f"tg{index}", 1000, "Question"))
+    mailbox = FakeMailbox(many)
+    result = _run(mailbox)
+    expect(
+        "no more than MAX_EMAILS_PER_RUN threads per run",
+        result.get("processed_count") == bot.MAX_EMAILS_PER_RUN,
+        f"processed_count={result.get('processed_count')}",
+    )
+
+    return failures
+
+
 def main():
     print("Escalation triggers:")
     failures = check_escalations()
@@ -823,6 +1105,9 @@ def main():
     print("\nEnd to end (process_single_message):")
     failures += check_end_to_end()
 
+    print("\nThread grouping:")
+    failures += check_thread_grouping()
+
     print("\nQuote stripping:")
     failures += check_quote_stripping()
 
@@ -834,6 +1119,7 @@ def main():
         + len(SENSITIVE_CASES)
         + 12  # sender allow-list
         + 13  # end to end
+        + 14  # thread grouping
         + 5  # quote stripping
     )
     if failures:

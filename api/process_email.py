@@ -32,10 +32,14 @@ MAX_EMAIL_CHARS = 30000
 ALLOWED_SENDERS_ENV = "ALLOWED_SENDERS"
 ALLOWED_SENDERS_ALL = "all"
 
-# One run handles at most this many emails. ~70 mails a day arrive in working
-# hours rather than evenly, so 5 was short at peak. Each email takes 15-20s and
+# One run handles at most this many THREADS. ~70 mails a day arrive in working
+# hours rather than evenly, so 5 was short at peak. Each thread takes 15-20s and
 # the platform kills the function at 300s, so 10 is about as high as this goes.
 MAX_EMAILS_PER_RUN = 10
+# How many unread messages to list before grouping. Several messages can collapse
+# into one thread, so listing only MAX_EMAILS_PER_RUN would let one talkative
+# customer starve everyone else out of the run.
+MAX_MESSAGES_SCANNED_PER_RUN = MAX_EMAILS_PER_RUN * 5
 PROCESS_WINDOW_DAYS = 7
 DELAY_BETWEEN_EMAILS_SECONDS = 1
 EXCLUDED_SENDER_TERMS = ["noreply", "no-reply", "mailer-daemon"]
@@ -798,6 +802,84 @@ def _finalize_message_labels(service, message_id, label_ids, add_label_key, remo
     ).execute()
 
 
+def _settle_older_thread_messages(service, older_refs, label_ids, label_key):
+    """Mark the non-newest messages of a thread read and give them label_key.
+
+    They get the same final label as the message that was actually answered, so
+    the thread reads consistently in Gmail and they never come back as unread.
+    No reply is sent for them and Claude is never called on them -- the newest
+    message already quotes everything they said.
+
+    Returns how many were settled. label_key None (nothing was applied to the
+    head either, e.g. an auto-reply) still clears UNREAD so they do not loop.
+    """
+    settled = 0
+    for older_ref in older_refs:
+        try:
+            _finalize_message_labels(service, older_ref["id"], label_ids, label_key)
+            settled += 1
+        except Exception as error:
+            print(f"[THREADS] Could not settle older message {older_ref['id']}: {error}")
+    return settled
+
+
+def group_refs_by_thread(message_refs):
+    """Group listed message refs by threadId, keeping first-seen thread order.
+
+    One angry customer writing five times between runs used to get five
+    separate replies, because every unread message was answered on its own.
+    Only the newest message of each thread is worth answering -- it quotes the
+    rest of the conversation underneath it.
+
+    A message with no threadId is treated as its own thread, so a malformed
+    ref can never be silently merged into someone else's conversation.
+    """
+    groups = {}
+    order = []
+    for index, message_ref in enumerate(message_refs):
+        thread_id = message_ref.get("threadId") or f"__no_thread__{index}"
+        if thread_id not in groups:
+            groups[thread_id] = []
+            order.append(thread_id)
+        groups[thread_id].append(message_ref)
+    return [(thread_id, groups[thread_id]) for thread_id in order]
+
+
+def newest_ref_in_group(service, group):
+    """Return (newest_ref, older_refs) for one thread's message refs.
+
+    Gmail lists newest first, but that is not a guarantee worth betting a
+    customer reply on: picking the wrong message means answering a stale
+    request while the real one goes unread. For a group of more than one, the
+    order is confirmed against internalDate. Single-message groups -- almost
+    every group -- cost no extra call.
+    """
+    if len(group) == 1:
+        return group[0], []
+
+    timestamps = {}
+    for message_ref in group:
+        try:
+            # "minimal" carries internalDate without any of the body payload.
+            meta = (
+                service.users()
+                .messages()
+                .get(userId="me", id=message_ref["id"], format="minimal")
+                .execute()
+            )
+            timestamps[message_ref["id"]] = int(meta.get("internalDate") or 0)
+        except Exception as error:
+            print(f"[THREADS] Could not read internalDate for {message_ref['id']}: {error}")
+            timestamps[message_ref["id"]] = 0
+
+    # Ties and total failures fall back to Gmail's own newest-first ordering.
+    ordered = sorted(
+        enumerate(group),
+        key=lambda pair: (-timestamps[pair[1]["id"]], pair[0]),
+    )
+    return ordered[0][1], [message_ref for _, message_ref in ordered[1:]]
+
+
 def process_unread_emails():
     senders = allowed_senders()
     if senders is None:
@@ -825,7 +907,7 @@ def process_unread_emails():
         .list(
             userId="me",
             q=build_unread_query(senders),
-            maxResults=MAX_EMAILS_PER_RUN,
+            maxResults=MAX_MESSAGES_SCANNED_PER_RUN,
         )
         .execute()
     )
@@ -833,10 +915,26 @@ def process_unread_emails():
     if not message_refs:
         return {"processed_count": 0, "results": [], "message": "No unread inbox email found."}
 
+    thread_groups = group_refs_by_thread(message_refs)
+    print(
+        f"[THREADS] {len(message_refs)} unread message(s) in {len(thread_groups)} thread(s); "
+        f"handling at most {MAX_EMAILS_PER_RUN}"
+    )
+    thread_groups = thread_groups[:MAX_EMAILS_PER_RUN]
+
     results = []
-    for index, message_ref in enumerate(message_refs):
+    skipped_older_count = 0
+    for index, (thread_id, group) in enumerate(thread_groups):
         if index > 0:
             time.sleep(DELAY_BETWEEN_EMAILS_SECONDS)
+
+        message_ref, older_refs = newest_ref_in_group(service, group)
+        if older_refs:
+            print(
+                f"[THREADS] Thread {thread_id}: {len(group)} unread message(s), "
+                f"answering {message_ref['id']} and folding in {len(older_refs)} older one(s)"
+            )
+
         message = (
             service.users()
             .messages()
@@ -848,6 +946,12 @@ def process_unread_emails():
         if label_ids["replied"] in existing_label_ids or label_ids["escalated"] in existing_label_ids:
             print(f"[LABELS] Message {message['id']} already has AI_REPLIED/AI_ESCALATED — skipping.")
             results.append({"processed": False, "message": "Already handled (AI_REPLIED/AI_ESCALATED label present). Skipped."})
+            # The head is done, so its older siblings are too. Left unread they
+            # would re-form this same group on every run and never finish.
+            settled_key = "replied" if label_ids["replied"] in existing_label_ids else "escalated"
+            skipped_older_count += _settle_older_thread_messages(
+                service, older_refs, label_ids, settled_key
+            )
             continue
 
         service.users().messages().modify(
@@ -857,7 +961,14 @@ def process_unread_emails():
         ).execute()
 
         try:
-            results.append(process_single_message(service, message, dry_run, label_ids))
+            single_result = process_single_message(service, message, dry_run, label_ids)
+            skipped_older = _settle_older_thread_messages(
+                service, older_refs, label_ids, single_result.get("label_key")
+            )
+            skipped_older_count += skipped_older
+            if skipped_older:
+                single_result["skipped_older_in_thread"] = skipped_older
+            results.append(single_result)
         except Exception as error:
             print(f"[LABELS] Message {message['id']} FAILED: {error}")
             try:
@@ -871,9 +982,15 @@ def process_unread_emails():
                 ).execute()
             except Exception as label_error:
                 print(f"[LABELS] Could not set AI_FAILED label: {label_error}")
+            # Older siblings stay unread on purpose: the next run retries the
+            # whole thread rather than losing the messages behind a label.
             results.append({"processed": False, "error": str(error)})
 
-    return {"processed_count": len(results), "results": results}
+    return {
+        "processed_count": len(results),
+        "skipped_older_in_thread": skipped_older_count,
+        "results": results,
+    }
 
 
 def _deliver_customer_reply(service, message, sender, subject, reply, dry_run):
@@ -916,7 +1033,7 @@ def process_single_message(service, message, dry_run, label_ids):
     # Check for auto-reply/bounce-back
     if is_auto_reply(subject, sender):
         _finalize_message_labels(service, message["id"], label_ids, add_label_key=None)
-        return {"processed": False, "message": "Auto-reply or bounce-back detected. Skipped."}
+        return {"processed": False, "label_key": None, "message": "Auto-reply or bounce-back detected. Skipped."}
 
     # Check for sensitive content (threats/legal language). Deliberately never
     # reaches Claude: generated text has no place in a reply to a threat or a
@@ -932,6 +1049,7 @@ def process_single_message(service, message, dry_run, label_ids):
             "subject": subject,
             "delivery": delivery,
             "message": "Sensitive content detected. Fixed template sent, escalated.",
+            "label_key": "escalated",
             "escalated": True,
             "escalation_reason": "SENSITIVE: Threats or legal language detected",
             "escalation": escalation_result,
@@ -977,6 +1095,7 @@ def process_single_message(service, message, dry_run, label_ids):
             "subject": subject,
             "delivery": delivery,
             "message": "Escalation trigger detected. Replied and escalated to ops team.",
+            "label_key": "escalated",
             "escalated": True,
             "escalation_reason": escalation_check["reason"],
             "escalation_category": category,
@@ -1023,6 +1142,7 @@ def process_single_message(service, message, dry_run, label_ids):
             "subject": subject,
             "delivery": delivery,
             "knowledge_base_files": kb_files,
+            "label_key": "escalated",
             "escalated": True,
             "escalation_reason": escalation_reason,
             "escalation_category": category_for_escalation_reason(marker_reason),
@@ -1035,6 +1155,7 @@ def process_single_message(service, message, dry_run, label_ids):
 
     return {
         "processed": True,
+        "label_key": "replied",
         "subject": subject,
         "delivery": delivery,
         "knowledge_base_files": kb_files,
