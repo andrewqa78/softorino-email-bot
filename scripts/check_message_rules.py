@@ -686,8 +686,20 @@ def check_end_to_end():
             f"processed={result.get('processed')}, reply={service.customer_reply()!r}",
         )
         expect(
-            "rule escalation notifies ops",
-            service.ops_notification() is not None,
+            "rule escalation does not page ops in DRY_RUN",
+            service.ops_notification() is None,
+            f"ops={service.ops_notification()!r}",
+        )
+        expect(
+            "the suppressed notification is described instead",
+            (result.get("escalation") or {}).get("suppressed_by_dry_run") is True
+            and (result.get("escalation") or {}).get("would_notify") == ["ops@softorino.app"],
+            f"escalation={result.get('escalation')}",
+        )
+        live, _ = _run_message("Just refund me, I don't want troubleshooting", dry_run=False)
+        expect(
+            "rule escalation notifies ops for real in live mode",
+            live.ops_notification() is not None,
         )
         expect(
             "rule escalation does not label in DRY_RUN",
@@ -735,8 +747,14 @@ def check_end_to_end():
             f"{len(CLAUDE_CALLS)} call(s) made",
         )
         expect(
-            "sensitive content notifies ops",
-            service.ops_notification() is not None,
+            "sensitive content does not page ops in DRY_RUN",
+            service.ops_notification() is None,
+            f"ops={service.ops_notification()!r}",
+        )
+        live, _ = _run_message("I'll sue you, I am calling my lawyer", dry_run=False)
+        expect(
+            "sensitive content notifies ops for real in live mode",
+            live.ops_notification() is not None,
         )
 
         # 4. The ordinary path must still behave.
@@ -1273,8 +1291,11 @@ def check_outgoing_stamp():
             f"{bot.BOT_HEADER_NAME}: {bot.BOT_HEADER_VALUE}" in reply,
             f"headers={reply.split(chr(10) * 2)[0]!r}",
         )
+        # The ops notification only exists in live mode now.
         service, _result = _run_message(
-            "Just refund me, I don't want troubleshooting", thread={"messages": []}
+            "Just refund me, I don't want troubleshooting",
+            thread={"messages": []},
+            dry_run=False,
         )
         ops = service.ops_notification() or ""
         expect(
@@ -1322,6 +1343,15 @@ QUIDGET_MAIL = {"id": "quidget-1", "subject": "[AI Chat] New conversation", "sta
 #
 # Gate skips are the exception. Those decisions do not depend on the mode, and
 # leaving them unread would have them re-listed on every run.
+
+
+def _ops_sends(mailbox):
+    """Ops notifications only.
+
+    escalate_email() sends a brand-new message with no threadId; a live
+    customer reply is sent with one. Both land in mailbox.sent.
+    """
+    return [body for body in mailbox.sent if "threadId" not in body]
 
 
 def check_dry_run():
@@ -1454,6 +1484,51 @@ def check_dry_run():
             result.get("draft_reply") == bot.SENSITIVE_ESCALATION_REPLY
             and result.get("escalated") is True,
             f"draft_reply={result.get('draft_reply')!r}",
+        )
+
+        # -- 4b. the ops notification is described, not sent --
+        # Dry runs reprocess the same messages every time, so a real page here
+        # would arrive once per press of Run workflow.
+        mailbox = FakeMailbox([("e1", "te", 1000, "Just refund me, I don't want troubleshooting")])
+        result = _run(mailbox, dry_run=True)
+        expect(
+            "no ops mail is sent in DRY_RUN",
+            not _ops_sends(mailbox),
+            f"ops sends={len(_ops_sends(mailbox))}",
+        )
+        suppressed = result.get("suppressed_ops_notifications") or []
+        expect(
+            "the run records what would have been sent",
+            len(suppressed) == 1,
+            f"suppressed={suppressed}",
+        )
+        if suppressed:
+            entry = suppressed[0]
+            expect(
+                "the record names the message, reason, category and recipients",
+                entry["message_id"] == "e1"
+                and entry["reason"] == "Refund Request (Customer Refuses Help)"
+                and entry["category"] == "billing"
+                and entry["would_notify"] == ["ops@softorino.app"]
+                and entry["customer"],
+                f"entry={entry}",
+            )
+
+        live_mailbox = FakeMailbox([
+            ("e1", "te", 1000, "Just refund me, I don't want troubleshooting")
+        ])
+        live_result = _run(live_mailbox, dry_run=False)
+        expect(
+            "a live run sends the ops mail and records nothing",
+            len(_ops_sends(live_mailbox)) == 1
+            and live_result.get("suppressed_ops_notifications") == [],
+            f"ops sends={len(_ops_sends(live_mailbox))}, "
+            f"suppressed={live_result.get('suppressed_ops_notifications')}",
+        )
+        expect(
+            "a run with no escalation records nothing either",
+            (_run(FakeMailbox([("n1", "tn", 1000, "Crash on launch")]), dry_run=True)
+             .get("suppressed_ops_notifications")) == [],
         )
 
         # -- 5. the run-level results carry it too, which is where it is read --
@@ -2292,14 +2367,14 @@ def main():
         + 2  # degenerate dedup inputs
         + len(SENSITIVE_CASES)
         + 12  # sender allow-list
-        + 15  # end to end
+        + 18  # end to end
         + 15  # thread grouping
         + 2   # outgoing stamp
-        + 32  # human / service gates
+        + 33  # human / service gates
         + 21  # message age
         + 18  # diagnostic mode
         + 23  # agent lookup
-        + 14  # dry run
+        + 19  # dry run
         + 5  # quote stripping
     )
     if failures:

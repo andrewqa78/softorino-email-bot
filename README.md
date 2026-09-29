@@ -311,10 +311,14 @@ alongside `escalated` and `escalation_category`. The drafts land in a mailbox
 the person reviewing the run cannot open, so without this a run is only
 counters. The field is absent in live mode.
 
-One thing `DRY_RUN` does **not** suppress: the escalation notification to the
-ops team is a real email either way. That is deliberate -- it goes to the team,
-not to the customer -- but it does mean a dry run over a large backlog will page
-them for every escalation it finds.
+**The ops notification is not sent either.** Because nothing is marked
+handled, dry runs are idempotent: the same messages are reprocessed on every
+run, so a real notification would reach the team once per press of Run workflow.
+After the third identical page nobody reads them. What it would have said goes
+into `suppressed_ops_notifications` instead -- message id, subject, customer,
+escalation reason, priority, category and the recipients it would have gone to.
+`draft_reply` and `escalation_reason` already carry everything the notification
+carried.
 
 ## Gmail label-based state tracking
 

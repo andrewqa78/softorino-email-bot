@@ -911,7 +911,7 @@ Knowledge base:
             time.sleep(3)
 
 
-def escalate_email(service, sender, subject, email_content, reason, priority="NORMAL"):
+def escalate_email(service, sender, subject, email_content, reason, priority="NORMAL", dry_run=False):
     recipients = [
         email
         for email in (os.getenv("ESCALATION_EMAIL_1"), os.getenv("ESCALATION_EMAIL_2"))
@@ -924,13 +924,35 @@ def escalate_email(service, sender, subject, email_content, reason, priority="NO
         )
         return {"escalated": False, "recipients": [], "reason": reason, "priority": priority}
 
+    subject_prefix = f"[{priority}] " if priority != "NORMAL" else "[ESCALATION] "
+
+    # Dry runs are idempotent by design: the same messages are reprocessed on
+    # every run, so a real notification here would reach the team once per press
+    # of Run workflow. After the third identical page nobody reads them. The
+    # facts go into the run result instead -- draft_reply and escalation_reason
+    # already carry everything the notification would have said.
+    if dry_run:
+        print(
+            f"[DRY-RUN] Would notify {recipients} — "
+            f"reason={reason!r} priority={priority} customer={sender!r}"
+        )
+        return {
+            "escalated": False,
+            "suppressed_by_dry_run": True,
+            "would_notify": recipients,
+            "recipients": [],
+            "reason": reason,
+            "priority": priority,
+            "customer": sender,
+            "subject": f"{subject_prefix}{subject} — {sender}",
+        }
+
     print("Sending escalation to: ", recipients)
     print(
         f"[ESCALATION] Attempting notification to {recipients} — "
         f"reason={reason!r} priority={priority}"
     )
 
-    subject_prefix = f"[{priority}] " if priority != "NORMAL" else "[ESCALATION] "
     escalation_body = f"""[ESCALATION NOTIFICATION]
 Priority: {priority}
 
@@ -1360,6 +1382,9 @@ def process_unread_emails():
     # Every human-gate hit, with the message that triggered it. Without this
     # there is no telling "the gate works" from "the gate silences everything".
     human_gate_hits = []
+    # In DRY_RUN the ops notification is not sent; what it would have said is
+    # recorded here instead.
+    suppressed_ops_notifications = []
     for index, (thread_id, group) in enumerate(thread_groups):
         if index > 0:
             time.sleep(DELAY_BETWEEN_EMAILS_SECONDS)
@@ -1409,6 +1434,19 @@ def process_unread_emails():
             skip_reason = single_result.get("skipped_reason")
             if skip_reason:
                 skip_counts[skip_reason] = skip_counts.get(skip_reason, 0) + 1
+            escalation_info = single_result.get("escalation") or {}
+            if escalation_info.get("suppressed_by_dry_run"):
+                suppressed_ops_notifications.append(
+                    {
+                        "message_id": message["id"],
+                        "subject": single_result.get("subject", ""),
+                        "customer": escalation_info.get("customer", ""),
+                        "reason": escalation_info.get("reason", ""),
+                        "priority": escalation_info.get("priority", ""),
+                        "category": single_result.get("escalation_category"),
+                        "would_notify": escalation_info.get("would_notify", []),
+                    }
+                )
             if skip_reason in ("human", "human_check_failed"):
                 human_gate_hits.append(
                     {
@@ -1454,6 +1492,7 @@ def process_unread_emails():
         "skipped_stale": skip_counts["stale"],
         "human_check_failed": skip_counts["human_check_failed"],
         "human_gate_hits": human_gate_hits,
+        "suppressed_ops_notifications": suppressed_ops_notifications,
         "results": results,
     }
 
@@ -1622,7 +1661,7 @@ def process_single_message(
     # reaches Claude: generated text has no place in a reply to a threat or a
     # legal notice. The customer still hears back, from a fixed template.
     if detect_sensitive_content(latest_message, subject):
-        escalation_result = escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE")
+        escalation_result = escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE", dry_run=dry_run)
         delivery = _deliver_customer_reply(
             service, message, sender, subject, SENSITIVE_ESCALATION_REPLY, dry_run
         )
@@ -1664,7 +1703,7 @@ def process_single_message(
                 "skipped_duplicate": True,
             }
         else:
-            escalation_result = escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"])
+            escalation_result = escalate_email(service, sender, subject, email_content, escalation_check["reason"], priority=escalation_check["priority"], dry_run=dry_run)
         sender_display_name, sender_email = parseaddr(sender)
         category = category_for_escalation_reason(escalation_check["reason"])
         raw_reply = generate_reply(
@@ -1725,7 +1764,7 @@ def process_single_message(
                 "skipped_duplicate": True,
             }
         else:
-            escalation_result = escalate_email(service, sender, subject, email_content, escalation_reason, priority="NORMAL")
+            escalation_result = escalate_email(service, sender, subject, email_content, escalation_reason, priority="NORMAL", dry_run=dry_run)
         # Still send/draft the customer-facing reply. Claude already wrote it
         # from the KB escalation template, so nothing is appended to it here.
         delivery = _deliver_customer_reply(service, message, sender, subject, reply, dry_run)
