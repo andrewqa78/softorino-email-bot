@@ -1040,9 +1040,29 @@ def ensure_labels(service):
     return label_ids
 
 
-def _finalize_message_labels(service, message_id, label_ids, add_label_key, remove_unread=True):
+# Outcomes that mean "this message was dealt with by answering it". In DRY_RUN
+# no answer actually reached the customer, so applying these would take the
+# message out of the queue for good and no later run would ever pick it up.
+# Gate skips are not in here on purpose: those decisions are final in either
+# mode, and leaving them unread would have them re-listed every run.
+DRY_RUN_SUPPRESSED_LABEL_KEYS = frozenset({"replied", "escalated"})
+
+
+def _finalize_message_labels(
+    service, message_id, label_ids, add_label_key, remove_unread=True, dry_run=False
+):
     """Swap AI_PROCESSING for the given final state label in one API call
-    (and clear UNREAD at the same time, unless told not to)."""
+    (and clear UNREAD at the same time, unless told not to).
+
+    In DRY_RUN this does nothing for an outcome that implies a reply was sent,
+    because none was.
+    """
+    if dry_run and add_label_key in DRY_RUN_SUPPRESSED_LABEL_KEYS:
+        print(
+            f"[DRY-RUN] Message {message_id}: would set {AI_LABEL_NAMES[add_label_key]} "
+            f"and clear UNREAD — left untouched so a real run can still pick it up."
+        )
+        return
     remove_ids = [label_ids["processing"]]
     if remove_unread:
         remove_ids.append("UNREAD")
@@ -1054,7 +1074,7 @@ def _finalize_message_labels(service, message_id, label_ids, add_label_key, remo
     ).execute()
 
 
-def _settle_older_thread_messages(service, older_refs, label_ids, label_key):
+def _settle_older_thread_messages(service, older_refs, label_ids, label_key, dry_run=False):
     """Mark the non-newest messages of a thread read and give them label_key.
 
     They get the same final label as the message that was actually answered, so
@@ -1068,7 +1088,9 @@ def _settle_older_thread_messages(service, older_refs, label_ids, label_key):
     settled = 0
     for older_ref in older_refs:
         try:
-            _finalize_message_labels(service, older_ref["id"], label_ids, label_key)
+            _finalize_message_labels(
+                service, older_ref["id"], label_ids, label_key, dry_run=dry_run
+            )
             settled += 1
         except Exception as error:
             print(f"[THREADS] Could not settle older message {older_ref['id']}: {error}")
@@ -1364,15 +1386,16 @@ def process_unread_emails():
             # would re-form this same group on every run and never finish.
             settled_key = "replied" if label_ids["replied"] in existing_label_ids else "escalated"
             skipped_older_count += _settle_older_thread_messages(
-                service, older_refs, label_ids, settled_key
+                service, older_refs, label_ids, settled_key, dry_run=dry_run
             )
             continue
 
-        service.users().messages().modify(
-            userId="me",
-            id=message["id"],
-            body={"addLabelIds": [label_ids["processing"]]},
-        ).execute()
+        if not dry_run:
+            service.users().messages().modify(
+                userId="me",
+                id=message["id"],
+                body={"addLabelIds": [label_ids["processing"]]},
+            ).execute()
 
         try:
             single_result = process_single_message(
@@ -1399,7 +1422,7 @@ def process_unread_emails():
                     }
                 )
             skipped_older = _settle_older_thread_messages(
-                service, older_refs, label_ids, single_result.get("label_key")
+                service, older_refs, label_ids, single_result.get("label_key"), dry_run=dry_run
             )
             skipped_older_count += skipped_older
             if skipped_older:
@@ -1456,6 +1479,18 @@ def _deliver_customer_reply(service, message, sender, subject, reply, dry_run):
     return deliver_reply(service, draft_message, message.get("threadId"), dry_run)
 
 
+def _with_dry_run_reply(result, reply, dry_run):
+    """In DRY_RUN return the generated text itself.
+
+    The drafts land in a mailbox the person reviewing a run cannot open, so
+    counters are all they would otherwise get. Not added in live mode: the
+    customer already has the text.
+    """
+    if dry_run:
+        result["draft_reply"] = reply
+    return result
+
+
 def process_single_message(
     service, message, dry_run, label_ids, own_email="", agent_search_cache=None
 ):
@@ -1468,7 +1503,7 @@ def process_single_message(
     from_header = header_value(headers, "From")
     if is_own_address(from_header, own_email):
         print(f"[SKIP] Message {message['id']}: From is our own mailbox ({from_header!r}).")
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_service")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_service", dry_run=dry_run)
         return {
             "processed": False,
             "label_key": "skipped_service",
@@ -1480,7 +1515,7 @@ def process_single_message(
     # -- Gate 2: internal plumbing mail with no customer request in it.
     if is_service_subject(subject):
         print(f"[SKIP] Message {message['id']}: service subject {subject!r}.")
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_service")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_service", dry_run=dry_run)
         return {
             "processed": False,
             "label_key": "skipped_service",
@@ -1500,7 +1535,7 @@ def process_single_message(
             f"[SKIP] Message {message['id']}: {age_text} old "
             f"(limit {MAX_MESSAGE_AGE_HOURS}h) — an agent has almost certainly handled it."
         )
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_stale")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_stale", dry_run=dry_run)
         return {
             "processed": False,
             "label_key": "skipped_stale",
@@ -1516,7 +1551,7 @@ def process_single_message(
             f"[SKIP] Message {message['id']}: a human agent has replied in this thread "
             f"({thread_match['message_id']!r} {thread_match['subject']!r})."
         )
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_human")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_human", dry_run=dry_run)
         return {
             "processed": False,
             "label_key": "skipped_human",
@@ -1538,7 +1573,7 @@ def process_single_message(
     )
     if check_failed:
         print(f"[SKIP] Message {message['id']}: agent lookup failed — skipping rather than answering.")
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_human")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_human", dry_run=dry_run)
         return {
             "processed": False,
             "label_key": "skipped_human",
@@ -1552,7 +1587,7 @@ def process_single_message(
             f"[SKIP] Message {message['id']}: an agent wrote to {customer_address} recently "
             f"({agent_match['message_id']!r} {agent_match['subject']!r})."
         )
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_human")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_human", dry_run=dry_run)
         return {
             "processed": False,
             "label_key": "skipped_human",
@@ -1580,7 +1615,7 @@ def process_single_message(
 
     # Check for auto-reply/bounce-back
     if is_auto_reply(subject, sender):
-        _finalize_message_labels(service, message["id"], label_ids, add_label_key=None)
+        _finalize_message_labels(service, message["id"], label_ids, add_label_key=None, dry_run=dry_run)
         return {"processed": False, "label_key": None, "message": "Auto-reply or bounce-back detected. Skipped."}
 
     # Check for sensitive content (threats/legal language). Deliberately never
@@ -1591,17 +1626,23 @@ def process_single_message(
         delivery = _deliver_customer_reply(
             service, message, sender, subject, SENSITIVE_ESCALATION_REPLY, dry_run
         )
-        _finalize_message_labels(service, message["id"], label_ids, "escalated")
-        return {
-            "processed": True,
-            "subject": subject,
-            "delivery": delivery,
-            "message": "Sensitive content detected. Fixed template sent, escalated.",
-            "label_key": "escalated",
-            "escalated": True,
-            "escalation_reason": "SENSITIVE: Threats or legal language detected",
-            "escalation": escalation_result,
-        }
+        _finalize_message_labels(service, message["id"], label_ids, "escalated", dry_run=dry_run)
+        return _with_dry_run_reply(
+            {
+                "processed": True,
+                "subject": subject,
+                "delivery": delivery,
+                "message": "Sensitive content detected. Fixed template sent, escalated.",
+                "label_key": "escalated",
+                "escalated": True,
+                "escalation_reason": "SENSITIVE: Threats or legal language detected",
+                # No category: this reply is the fixed constant, not a KB template.
+                "escalation_category": None,
+                "escalation": escalation_result,
+            },
+            SENSITIVE_ESCALATION_REPLY,
+            dry_run,
+        )
 
     # Check for escalation triggers
     escalation_check = detect_escalation_triggers(latest_message)
@@ -1637,19 +1678,23 @@ def process_single_message(
         )
         reply, _marker_reason = extract_escalation_marker(raw_reply)
         delivery = _deliver_customer_reply(service, message, sender, subject, reply, dry_run)
-        _finalize_message_labels(service, message["id"], label_ids, "escalated")
-        return {
-            "processed": True,
-            "subject": subject,
-            "delivery": delivery,
-            "message": "Escalation trigger detected. Replied and escalated to ops team.",
-            "label_key": "escalated",
-            "escalated": True,
-            "escalation_reason": escalation_check["reason"],
-            "escalation_category": category,
-            "knowledge_base_files": kb_files,
-            "escalation": escalation_result,
-        }
+        _finalize_message_labels(service, message["id"], label_ids, "escalated", dry_run=dry_run)
+        return _with_dry_run_reply(
+            {
+                "processed": True,
+                "subject": subject,
+                "delivery": delivery,
+                "message": "Escalation trigger detected. Replied and escalated to ops team.",
+                "label_key": "escalated",
+                "escalated": True,
+                "escalation_reason": escalation_check["reason"],
+                "escalation_category": category,
+                "knowledge_base_files": kb_files,
+                "escalation": escalation_result,
+            },
+            reply,
+            dry_run,
+        )
 
     # Generate reply
     knowledge_base, kb_files = build_knowledge_base(email_content)
@@ -1684,30 +1729,39 @@ def process_single_message(
         # Still send/draft the customer-facing reply. Claude already wrote it
         # from the KB escalation template, so nothing is appended to it here.
         delivery = _deliver_customer_reply(service, message, sender, subject, reply, dry_run)
-        _finalize_message_labels(service, message["id"], label_ids, "escalated")
-        return {
-            "processed": True,
-            "subject": subject,
-            "delivery": delivery,
-            "knowledge_base_files": kb_files,
-            "label_key": "escalated",
-            "escalated": True,
-            "escalation_reason": escalation_reason,
-            "escalation_category": category_for_escalation_reason(marker_reason),
-            "escalation": escalation_result,
-        }
+        _finalize_message_labels(service, message["id"], label_ids, "escalated", dry_run=dry_run)
+        return _with_dry_run_reply(
+            {
+                "processed": True,
+                "subject": subject,
+                "delivery": delivery,
+                "knowledge_base_files": kb_files,
+                "label_key": "escalated",
+                "escalated": True,
+                "escalation_reason": escalation_reason,
+                "escalation_category": category_for_escalation_reason(marker_reason),
+                "escalation": escalation_result,
+            },
+            reply,
+            dry_run,
+        )
 
     # Deliver reply (draft in DRY_RUN, sent live otherwise)
     delivery = _deliver_customer_reply(service, message, sender, subject, reply, dry_run)
-    _finalize_message_labels(service, message["id"], label_ids, "replied")
+    _finalize_message_labels(service, message["id"], label_ids, "replied", dry_run=dry_run)
 
-    return {
-        "processed": True,
-        "label_key": "replied",
-        "subject": subject,
-        "delivery": delivery,
-        "knowledge_base_files": kb_files,
-    }
+    return _with_dry_run_reply(
+        {
+            "processed": True,
+            "label_key": "replied",
+            "subject": subject,
+            "delivery": delivery,
+            "knowledge_base_files": kb_files,
+            "escalated": False,
+        },
+        reply,
+        dry_run,
+    )
 
 
 class handler(BaseHTTPRequestHandler):

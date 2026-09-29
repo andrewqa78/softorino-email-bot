@@ -292,6 +292,30 @@ the branch at the top of `process_unread_emails()` once the question is settled.
 `scripts/diagnose_agent_replies.py` does the same thing from a terminal, for
 anyone who has the credentials to hand.
 
+## DRY_RUN
+
+`DRY_RUN=true` drafts the reply instead of sending it. Two things follow from
+that, and both matter when reading a run.
+
+**A processed message is left exactly as it was.** No `AI_REPLIED`, no
+`AI_ESCALATED`, not even `AI_PROCESSING`, and `UNREAD` stays on. The reply never
+reached the customer, so marking the message handled would drop it out of the
+queue for good: no later run would list it and nobody would ever answer it.
+
+**Gate skips still label and mark read.** Those decisions -- own mailbox,
+service mail, stale, human-handled -- do not depend on the mode, and leaving
+them unread would have them re-listed on every run and crowd out fresh mail.
+
+**Each processed message carries `draft_reply`**, the generated text in full,
+alongside `escalated` and `escalation_category`. The drafts land in a mailbox
+the person reviewing the run cannot open, so without this a run is only
+counters. The field is absent in live mode.
+
+One thing `DRY_RUN` does **not** suppress: the escalation notification to the
+ops team is a real email either way. That is deliberate -- it goes to the team,
+not to the customer -- but it does mean a dry run over a large backlog will page
+them for every escalation it finds.
+
 ## Gmail label-based state tracking
 
 The bot creates and manages 7 Gmail labels to track processing state per

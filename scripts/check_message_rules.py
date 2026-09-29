@@ -634,6 +634,7 @@ def _run_message(
     internal_date=_UNSET,
     agent_search_rows=None,
     cache=None,
+    dry_run=True,
 ):
     service = FakeGmailService(thread, agent_search_rows)
     CLAUDE_CALLS.clear()
@@ -642,7 +643,7 @@ def _run_message(
         lambda: bot.process_single_message(
             service,
             incoming,
-            True,
+            dry_run,
             LABEL_IDS,
             own_email=OWN_MAILBOX,
             agent_search_cache=cache,
@@ -689,9 +690,15 @@ def check_end_to_end():
             service.ops_notification() is not None,
         )
         expect(
-            "rule escalation labels the message AI_ESCALATED",
-            service.added_labels() == [ESCALATED_LABEL],
+            "rule escalation does not label in DRY_RUN",
+            service.added_labels() == [],
             f"added={service.added_labels()}",
+        )
+        live, _ = _run_message("Just refund me, I don't want troubleshooting", dry_run=False)
+        expect(
+            "rule escalation labels the message AI_ESCALATED for real",
+            live.added_labels() == [ESCALATED_LABEL],
+            f"added={live.added_labels()}",
         )
         expect(
             "rule escalation passes the billing category to Claude",
@@ -741,9 +748,17 @@ def check_end_to_end():
             result.get("processed") is True and service.customer_reply() is not None,
         )
         expect(
-            "normal reply is labelled AI_REPLIED",
-            service.added_labels() == [LABEL_IDS["replied"]],
+            "normal reply does not label in DRY_RUN",
+            service.added_labels() == [],
             f"added={service.added_labels()}",
+        )
+        live, _ = _run_message(
+            "WALTR PRO will not start on Windows 11", subject="Crash", dry_run=False
+        )
+        expect(
+            "normal reply is labelled AI_REPLIED for real",
+            live.added_labels() == [LABEL_IDS["replied"]],
+            f"added={live.added_labels()}",
         )
         expect(
             "normal reply carries no escalation category",
@@ -1060,9 +1075,22 @@ def _run_environment(mailbox):
         bot.DELAY_BETWEEN_EMAILS_SECONDS = original_delay
 
 
-def _run(mailbox):
+@contextlib.contextmanager
+def dry_run_env(value):
+    previous = os.environ.get("DRY_RUN")
+    os.environ["DRY_RUN"] = "true" if value else "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("DRY_RUN", None)
+        else:
+            os.environ["DRY_RUN"] = previous
+
+
+def _run(mailbox, dry_run=True):
     CLAUDE_CALLS.clear()
-    with _run_environment(mailbox):
+    with _run_environment(mailbox), dry_run_env(dry_run):
         return _quiet(bot.process_unread_emails)
 
 
@@ -1285,6 +1313,162 @@ AUTORESPONDER = {
 AGENT_MAIL = {"id": "agent-1", "subject": "Re: unable to activate folder colorizer", "stamped": False}
 BOT_MAIL = {"id": "bot-1", "subject": "Re: Crash on launch", "stamped": True}
 QUIDGET_MAIL = {"id": "quidget-1", "subject": "[AI Chat] New conversation", "stamped": False}
+
+
+# --- DRY_RUN ----------------------------------------------------------------
+# In DRY_RUN no reply reaches the customer. Applying AI_REPLIED and clearing
+# UNREAD anyway would drop the message out of the queue for good: no later run
+# would list it, and the customer would never be answered by anyone.
+#
+# Gate skips are the exception. Those decisions do not depend on the mode, and
+# leaving them unread would have them re-listed on every run.
+
+
+def check_dry_run():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+
+    try:
+        # -- 1. a processed message must come out of a dry run unchanged --
+        mailbox = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+        before = mailbox.labels_of("m1")
+        result = _run(mailbox, dry_run=True)
+        expect(
+            "a dry run still produces a draft",
+            len(mailbox.created_drafts) == 1 and result.get("processed_count") == 1,
+            f"drafts={len(mailbox.created_drafts)}",
+        )
+        expect(
+            "a dry run leaves the message UNREAD",
+            "UNREAD" in mailbox.labels_of("m1"),
+            f"labels={mailbox.labels_of('m1')}",
+        )
+        expect(
+            "a dry run applies no label at all, not even AI_PROCESSING",
+            mailbox.labels_of("m1") == before,
+            f"before={before}, after={mailbox.labels_of('m1')}",
+        )
+        expect(
+            "a dry run makes no modify call for that message",
+            not [entry for entry in mailbox.modifies if entry[0] == "m1"],
+            f"modifies={mailbox.modifies}",
+        )
+
+        # The point of all of it: a later real run still sees the message.
+        live_mailbox = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+        _run(live_mailbox, dry_run=False)
+        expect(
+            "the same message in a live run is labelled and marked read",
+            "id-AI_REPLIED" in live_mailbox.labels_of("m1")
+            and "UNREAD" not in live_mailbox.labels_of("m1"),
+            f"labels={live_mailbox.labels_of('m1')}",
+        )
+
+        # -- 2. gate skips still settle the message in DRY_RUN --
+        mailbox = FakeMailbox([("s1", "ts", 1000, "[AI Chat] New conversation")])
+        _run(mailbox, dry_run=True)
+        expect(
+            "a service-mail skip still labels in DRY_RUN",
+            "id-AI_SKIPPED_SERVICE" in mailbox.labels_of("s1")
+            and "UNREAD" not in mailbox.labels_of("s1"),
+            f"labels={mailbox.labels_of('s1')}",
+        )
+
+        mailbox = FakeMailbox([("o1", "told", 1000, "Old ticket")])
+        mailbox.store["o1"]["internalDate"] = _epoch_ms_hours_ago(30)
+        _run(mailbox, dry_run=True)
+        expect(
+            "a stale skip still labels in DRY_RUN",
+            "id-AI_SKIPPED_STALE" in mailbox.labels_of("o1")
+            and "UNREAD" not in mailbox.labels_of("o1"),
+            f"labels={mailbox.labels_of('o1')}",
+        )
+
+        mailbox = FakeMailbox([("h1", "th", 1000, "Any update?")])
+        mailbox.agent_search_rows = [AGENT_MAIL]
+        _run(mailbox, dry_run=True)
+        expect(
+            "a human-gate skip still labels in DRY_RUN",
+            "id-AI_SKIPPED_HUMAN" in mailbox.labels_of("h1")
+            and "UNREAD" not in mailbox.labels_of("h1"),
+            f"labels={mailbox.labels_of('h1')}",
+        )
+
+        # -- 3. the generated text comes back in the response --
+        service, result = _run_message(
+            "My app will not start", thread={"messages": []}, dry_run=True
+        )
+        expect(
+            "DRY_RUN returns the generated reply",
+            result.get("draft_reply") == CLAUDE_STUB_REPLY,
+            f"draft_reply={result.get('draft_reply')!r}",
+        )
+        expect(
+            "the reply is returned whole, not truncated",
+            result.get("draft_reply", "").endswith("Softorino Support Team")
+            and len(result.get("draft_reply", "")) == len(CLAUDE_STUB_REPLY),
+        )
+        expect(
+            "a normal reply reports escalated false",
+            result.get("escalated") is False,
+            f"escalated={result.get('escalated')!r}",
+        )
+
+        service, result = _run_message("My app will not start", dry_run=False)
+        expect(
+            "live mode does not return the reply",
+            "draft_reply" not in result,
+            f"keys={sorted(result)}",
+        )
+
+        # -- 4. escalations report their category alongside the text --
+        service, result = _run_message(
+            "Just refund me, I don't want troubleshooting",
+            thread={"messages": []},
+            dry_run=True,
+        )
+        expect(
+            "an escalation returns the reply, escalated and the category",
+            result.get("draft_reply") == CLAUDE_STUB_REPLY
+            and result.get("escalated") is True
+            and result.get("escalation_category") == "billing",
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+
+        service, result = _run_message(
+            "I'll sue you, I am calling my lawyer", thread={"messages": []}, dry_run=True
+        )
+        expect(
+            "sensitive content returns the fixed template it would send",
+            result.get("draft_reply") == bot.SENSITIVE_ESCALATION_REPLY
+            and result.get("escalated") is True,
+            f"draft_reply={result.get('draft_reply')!r}",
+        )
+
+        # -- 5. the run-level results carry it too, which is where it is read --
+        mailbox = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+        result = _run(mailbox, dry_run=True)
+        entry = result["results"][0]
+        expect(
+            "the run results carry the draft text per message",
+            entry.get("draft_reply") == CLAUDE_STUB_REPLY,
+            f"entry keys={sorted(entry)}",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
 
 
 def check_agent_lookup():
@@ -1679,12 +1863,24 @@ def check_thread_grouping():
         f"result={ {k: v for k, v in result.items() if k != 'results'} }",
     )
     expect(
-        "older messages get the answered message's label and lose UNREAD",
+        "older messages are left untouched in DRY_RUN",
+        all("UNREAD" in mailbox.labels_of(m) for m in ("m1", "m3")),
+        f"m1={mailbox.labels_of('m1')}, m3={mailbox.labels_of('m3')}",
+    )
+    live_mailbox = FakeMailbox([
+        ("m1", "t1", 1000, SUBJECT),
+        ("m2", "t1", 3000, SUBJECT),
+        ("m3", "t1", 2000, SUBJECT),
+    ])
+    _run(live_mailbox, dry_run=False)
+    expect(
+        "older messages get the answered message's label and lose UNREAD for real",
         all(
-            "id-AI_REPLIED" in mailbox.labels_of(m) and "UNREAD" not in mailbox.labels_of(m)
+            "id-AI_REPLIED" in live_mailbox.labels_of(m)
+            and "UNREAD" not in live_mailbox.labels_of(m)
             for m in ("m1", "m3")
         ),
-        f"m1={mailbox.labels_of('m1')}, m3={mailbox.labels_of('m3')}",
+        f"m1={live_mailbox.labels_of('m1')}, m3={live_mailbox.labels_of('m3')}",
     )
     expect(
         "one result entry, not three",
@@ -2074,6 +2270,9 @@ def main():
     print("\nDiagnostic mode (temporary):")
     failures += check_diagnostic_mode()
 
+    print("\nDRY_RUN behaviour:")
+    failures += check_dry_run()
+
     print("\nAgent lookup by address:")
     failures += check_agent_lookup()
 
@@ -2093,13 +2292,14 @@ def main():
         + 2  # degenerate dedup inputs
         + len(SENSITIVE_CASES)
         + 12  # sender allow-list
-        + 13  # end to end
-        + 14  # thread grouping
+        + 15  # end to end
+        + 15  # thread grouping
         + 2   # outgoing stamp
         + 32  # human / service gates
         + 21  # message age
         + 18  # diagnostic mode
         + 23  # agent lookup
+        + 14  # dry run
         + 5  # quote stripping
     )
     if failures:
