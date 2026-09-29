@@ -419,13 +419,35 @@ def is_stale_message(message, now_ms=None):
     return age >= MAX_MESSAGE_AGE_HOURS
 
 
+# "Re:", "RE:", "Fwd:", "FW:", "Re[2]:" and chains of them. Mail clients stack
+# these, so "RE: RE: Fwd: ..." is ordinary.
+REPLY_PREFIX_PATTERN = re.compile(r"^\s*(?:re|fwd|fw)\s*(?:\[\d+\])?\s*:\s*", re.IGNORECASE)
+
+
+def strip_reply_prefixes(subject):
+    """Remove every leading Re:/Fwd: marker from a subject.
+
+    A prefix test against the raw subject misses the moment anyone replies:
+    "Re: [AI Chat] License Recovery" went through the service-mail gate as a
+    customer request because it does not start with "[AI Chat]" any more.
+    """
+    text = (subject or "").strip()
+    while True:
+        shorter = REPLY_PREFIX_PATTERN.sub("", text, count=1)
+        if shorter == text:
+            return text
+        text = shorter
+
+
 def is_service_subject(subject):
     """True for internal plumbing mail that carries no customer request."""
-    normalised = (subject or "").strip().lower()
+    normalised = strip_reply_prefixes(subject).lower()
     if not normalised:
         return False
     if any(normalised.startswith(prefix) for prefix in SERVICE_SUBJECT_PREFIXES):
         return True
+    # The term test is a substring search, so a leading "Re:" never broke it.
+    # It runs on the stripped subject anyway, so both lists see the same text.
     return any(term in normalised for term in SERVICE_SUBJECT_TERMS)
 
 
@@ -1319,6 +1341,21 @@ def run_mailbox_diagnostic(service, addresses):
     }
 
 
+def unread_message_count(service):
+    """How many unread messages the mailbox holds in total.
+
+    One call against the UNREAD label, rather than paging the queue. The run
+    only ever looks at MAX_MESSAGES_SCANNED_PER_RUN of them, so without this
+    there is no way to tell a nearly empty backlog from a growing one.
+    """
+    try:
+        label = service.users().labels().get(userId="me", id="UNREAD").execute()
+        return label.get("messagesUnread")
+    except Exception as error:
+        print(f"[QUEUE] Could not read the UNREAD label: {error}")
+        return None
+
+
 def process_unread_emails():
     # TEMPORARY -- diagnostic mode short-circuits the whole run, before the
     # ALLOWED_SENDERS guard, so the report does not depend on how the bot's own
@@ -1364,7 +1401,12 @@ def process_unread_emails():
     )
     message_refs = result.get("messages", [])
     if not message_refs:
-        return {"processed_count": 0, "results": [], "message": "No unread inbox email found."}
+        return {
+            "processed_count": 0,
+            "unread_total": unread_message_count(service),
+            "results": [],
+            "message": "No unread inbox email found.",
+        }
 
     thread_groups = group_refs_by_thread(message_refs)
     print(
@@ -1485,6 +1527,7 @@ def process_unread_emails():
 
     return {
         "processed_count": len(results),
+        "unread_total": unread_message_count(service),
         "skipped_older_in_thread": skipped_older_count,
         "skipped_human_handled": skip_counts["human"],
         "skipped_service_mail": skip_counts["service"],

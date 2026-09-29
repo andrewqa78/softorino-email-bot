@@ -950,6 +950,9 @@ class FakeMailbox:
                 "subject": subject,
             }
         self.created_drafts = []
+        self.unread_total = 137
+        self.unread_total_raises = False
+        self.label_gets = []
         self.agent_search_rows = []
         self.thread_messages = []
         self.sender = "Angry Customer <angry@example.com>"
@@ -1060,6 +1063,12 @@ class _MailboxDrafts:
 class _MailboxLabels:
     def __init__(self, mailbox):
         self.mb = mailbox
+
+    def get(self, userId=None, id=None):
+        self.mb.label_gets.append(id)
+        if self.mb.unread_total_raises:
+            raise RuntimeError("Gmail is having a moment")
+        return _Call({"id": id, "messagesUnread": self.mb.unread_total})
 
     def list(self, userId=None):
         return _Call({"labels": [{"name": name, "id": f"id-{name}"} for name in bot.AI_LABEL_NAMES.values()]})
@@ -1352,6 +1361,153 @@ def _ops_sends(mailbox):
     customer reply is sent with one. Both land in mailbox.sent.
     """
     return [body for body in mailbox.sent if "threadId" not in body]
+
+
+# --- subject normalisation and the queue size -------------------------------
+# "Re: [AI Chat] License Recovery - Lost Key Issue" walked straight through the
+# service-mail gate on a live run: the prefix test ran against the raw subject,
+# and the moment anyone replies the subject no longer starts with "[AI Chat]".
+
+SERVICE_SUBJECT_CASES = [
+    # (subject, expected)
+    ("[AI Chat] License Recovery", True),
+    ("Re: [AI Chat] License Recovery - Lost Key Issue", True),
+    ("RE: [AI Chat] License Recovery", True),
+    ("re: [ai chat] license recovery", True),
+    ("Fwd: [AI Chat] License Recovery", True),
+    ("FW: [AI Chat] License Recovery", True),
+    ("Fw: [AI Chat] License Recovery", True),
+    ("Re[2]: [AI Chat] License Recovery", True),
+    ("RE: RE: [AI Chat] License Recovery", True),
+    ("Fw: Re: [AI Chat] License Recovery", True),
+    ("RE:[AI Chat] License Recovery", True),
+    ("  re : [AI Chat] License Recovery  ", True),
+    ("Your Softorino support request has been received", True),
+    ("Re: Your Softorino support request has been received", True),
+    ("RE: RE: Your Softorino support request has been received \u2764\ufe0f", True),
+    # Subjects that merely begin with those letters must survive untouched.
+    ("Refund request for my order", False),
+    ("Reply needed: my app crashes", False),
+    ("Regarding: activation on a second Mac", False),
+    ("Review of my licence", False),
+    ("Forward my licence to a new email", False),
+    ("FWIW the app still crashes", False),
+    ("My app will not start", False),
+    ("", False),
+    ("Re:", False),
+]
+
+
+def check_subject_normalisation():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    for subject, expected in SERVICE_SUBJECT_CASES:
+        actual = bot.is_service_subject(subject)
+        expect(
+            f"{'service' if expected else 'not service'}: {subject!r}",
+            actual == expected,
+            f"expected {expected}, got {actual}, stripped to "
+            f"{bot.strip_reply_prefixes(subject)!r}",
+        )
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+    try:
+        # The live case, end to end.
+        service, result = _run_message(
+            "A visitor started a chat",
+            subject="Re: [AI Chat] License Recovery - Lost Key Issue",
+            thread={"messages": []},
+        )
+        expect(
+            "a replied-to [AI Chat] notification is skipped as service mail",
+            result.get("skipped_reason") == "service" and service.customer_reply() is None,
+            f"result={result!r}",
+        )
+        # The agent classification asks the same function, so it is fixed too.
+        service, result = _run_message(
+            "My app will not start",
+            thread={"messages": []},
+            agent_search_rows=[
+                {
+                    "id": "auto-2",
+                    "subject": "Re: Your Softorino support request has been received",
+                    "stamped": False,
+                }
+            ],
+        )
+        expect(
+            "a replied-to autoresponder is still not an agent",
+            result.get("processed") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
+def check_unread_total():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+    try:
+        mailbox = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+        mailbox.unread_total = 842
+        result = _run(mailbox)
+        expect(
+            "the run reports the whole unread queue, not just what it scanned",
+            result.get("unread_total") == 842 and result.get("processed_count") == 1,
+            f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+        )
+        expect(
+            "it reads the UNREAD label rather than paging messages",
+            mailbox.label_gets == ["UNREAD"],
+            f"label_gets={mailbox.label_gets}",
+        )
+
+        empty = FakeMailbox([])
+        empty.unread_total = 0
+        result = _run(empty)
+        expect(
+            "an empty queue reports zero rather than omitting the field",
+            result.get("unread_total") == 0,
+            f"result={result!r}",
+        )
+
+        broken = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+        broken.unread_total_raises = True
+        result = _run(broken)
+        expect(
+            "a failed label lookup reports null and does not break the run",
+            "unread_total" in result
+            and result["unread_total"] is None
+            and result.get("processed_count") == 1,
+            f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
 
 
 def check_dry_run():
@@ -2345,6 +2501,12 @@ def main():
     print("\nDiagnostic mode (temporary):")
     failures += check_diagnostic_mode()
 
+    print("\nSubject normalisation:")
+    failures += check_subject_normalisation()
+
+    print("\nUnread queue size:")
+    failures += check_unread_total()
+
     print("\nDRY_RUN behaviour:")
     failures += check_dry_run()
 
@@ -2375,6 +2537,9 @@ def main():
         + 18  # diagnostic mode
         + 23  # agent lookup
         + 19  # dry run
+        + len(SERVICE_SUBJECT_CASES)
+        + 2   # subject normalisation, end to end
+        + 4   # unread total
         + 5  # quote stripping
     )
     if failures:

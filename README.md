@@ -213,7 +213,12 @@ and returns. Nothing is sent to the customer and Claude is never called.
 2. **Service mail.** Subjects starting with a `SERVICE_SUBJECT_PREFIXES` entry
    (`[AI Chat]`, Quidget's agent notifications) or containing a
    `SERVICE_SUBJECT_TERMS` entry (our autoresponder). Both lists are meant to
-   grow.
+   grow. Leading `Re:` / `RE:` / `Fwd:` / `FW:` / `Re[2]:` markers, including
+   chains of them, are stripped first: without that, `Re: [AI Chat] License
+   Recovery` reads as a customer request the moment anyone replies, which is
+   what happened on a live run. Subjects that merely start with those letters
+   (`Refund`, `Reply needed:`, `Regarding:`, `Forward my licence`) are left
+   alone.
 3. **The message is older than `MAX_MESSAGE_AGE_HOURS` (12).** Groove never
    clears `UNREAD` in Gmail, so unread mail piles up and the queue fills with
    tickets agents closed days ago. Anything that has sat for half a day is
@@ -260,6 +265,12 @@ Two things follow from gate 4 and are intentional:
 - A thread that cannot be read, or an own-address lookup that fails, counts as
   human-handled. One unanswered email is cheaper than a reply written over an
   agent in front of the customer.
+
+`unread_total` in the run result is the whole unread queue, read in one call
+off the `UNREAD` label rather than by paging messages. A run only ever looks at
+`MAX_MESSAGES_SCANNED_PER_RUN` of them, so without it there is no telling a
+nearly empty backlog from a growing one. It is `null` if the lookup fails, which
+does not stop the run.
 
 The run result reports `skipped_human_handled`, `skipped_service_mail`,
 `skipped_own_mail`, `skipped_stale` and `human_check_failed`, plus
