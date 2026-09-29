@@ -41,6 +41,11 @@ MAX_EMAILS_PER_RUN = 10
 # customer starve everyone else out of the run.
 MAX_MESSAGES_SCANNED_PER_RUN = MAX_EMAILS_PER_RUN * 5
 PROCESS_WINDOW_DAYS = 7
+# Groove does not clear the UNREAD flag in Gmail, so unread mail piles up and
+# the queue is mostly old tickets that agents closed days ago. Answering one of
+# those is how the bot replied over agent Amy on a case she had already
+# refunded. Anything that has sat for half a day is assumed handled.
+MAX_MESSAGE_AGE_HOURS = 12
 DELAY_BETWEEN_EMAILS_SECONDS = 1
 EXCLUDED_SENDER_TERMS = ["noreply", "no-reply", "mailer-daemon"]
 EXCLUDED_SUBJECT_TERMS = [
@@ -356,6 +361,40 @@ def is_own_address(address, own_email):
     if not own_email:
         return False
     return own_email in (address or "").lower()
+
+
+def message_age_hours(message, now_ms=None):
+    """Age of a Gmail message in hours, from its internalDate.
+
+    internalDate is epoch milliseconds UTC as a string. Returns None when it is
+    missing or unparseable -- callers treat that as too old, because the only
+    other option is answering a message whose age is unknown.
+    """
+    raw = message.get("internalDate")
+    try:
+        internal_ms = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if internal_ms <= 0:
+        return None
+    current_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    return (current_ms - internal_ms) / 3_600_000
+
+
+def is_stale_message(message, now_ms=None):
+    """True when the message is at or past MAX_MESSAGE_AGE_HOURS.
+
+    The comparison is >= on purpose: a message sitting exactly on the boundary
+    should not flip on the seconds it took the run to reach it.
+    """
+    age = message_age_hours(message, now_ms)
+    if age is None:
+        print(
+            f"[STALE] Message {message.get('id')}: internalDate missing or unreadable "
+            f"({message.get('internalDate')!r}) — treating as stale."
+        )
+        return True
+    return age >= MAX_MESSAGE_AGE_HOURS
 
 
 def is_service_subject(subject):
@@ -867,6 +906,7 @@ AI_LABEL_NAMES = {
     # Skipped on purpose, with the reason visible in Gmail.
     "skipped_human": "AI_SKIPPED_HUMAN",
     "skipped_service": "AI_SKIPPED_SERVICE",
+    "skipped_stale": "AI_SKIPPED_STALE",
 }
 
 
@@ -1035,7 +1075,7 @@ def process_unread_emails():
 
     results = []
     skipped_older_count = 0
-    skip_counts = {"human": 0, "service": 0, "self": 0}
+    skip_counts = {"human": 0, "service": 0, "self": 0, "stale": 0}
     for index, (thread_id, group) in enumerate(thread_groups):
         if index > 0:
             time.sleep(DELAY_BETWEEN_EMAILS_SECONDS)
@@ -1109,6 +1149,7 @@ def process_unread_emails():
         "skipped_human_handled": skip_counts["human"],
         "skipped_service_mail": skip_counts["service"],
         "skipped_own_mail": skip_counts["self"],
+        "skipped_stale": skip_counts["stale"],
         "results": results,
     }
 
@@ -1165,7 +1206,27 @@ def process_single_message(service, message, dry_run, label_ids, own_email=""):
             "message": "Service notification, not a customer request. Skipped, no reply.",
         }
 
-    # -- Gate 3: a human agent is already answering in this thread.
+    # -- Gate 3: the message has been sitting too long to still be current.
+    # Local check, no API call, so it runs before anything expensive. The label
+    # and the cleared UNREAD flag matter as much as the skip: left unread, these
+    # would be re-listed every run and crowd fresh mail out of the scan budget.
+    if is_stale_message(message):
+        age = message_age_hours(message)
+        age_text = f"{age:.1f}h" if age is not None else "unknown age"
+        print(
+            f"[SKIP] Message {message['id']}: {age_text} old "
+            f"(limit {MAX_MESSAGE_AGE_HOURS}h) — an agent has almost certainly handled it."
+        )
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_stale")
+        return {
+            "processed": False,
+            "label_key": "skipped_stale",
+            "skipped_reason": "stale",
+            "subject": subject,
+            "message": f"Older than {MAX_MESSAGE_AGE_HOURS}h. Skipped, no reply.",
+        }
+
+    # -- Gate 4: a human agent is already answering in this thread.
     if thread_has_human_reply(service, message.get("threadId"), own_email):
         print(f"[SKIP] Message {message['id']}: a human agent has replied in this thread.")
         _finalize_message_labels(service, message["id"], label_ids, "skipped_human")

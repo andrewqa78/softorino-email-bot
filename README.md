@@ -41,7 +41,8 @@ softorino-email-bot/
 │   └── process_email.py
 ├── scripts/
 │   ├── check_kb_routing.py
-│   └── check_message_rules.py
+│   ├── check_message_rules.py
+│   └── diagnose_agent_replies.py
 ├── .github/workflows/
 │   ├── check-kb-routing.yml
 │   ├── check-message-rules.yml
@@ -202,7 +203,7 @@ matter: bare substrings are what caused both bugs.
 
 ## Never talking over a person
 
-Three gates run before anything else, in this order. Each one labels the message
+Four gates run before anything else, in this order. Each one labels the message
 and returns. Nothing is sent to the customer and Claude is never called.
 
 1. **Mail from our own mailbox.** `From` matching the authenticated account is
@@ -213,17 +214,26 @@ and returns. Nothing is sent to the customer and Claude is never called.
    (`[AI Chat]`, Quidget's agent notifications) or containing a
    `SERVICE_SUBJECT_TERMS` entry (our autoresponder). Both lists are meant to
    grow.
-3. **A human agent already replied in the thread.** Every message the bot sends
+3. **The message is older than `MAX_MESSAGE_AGE_HOURS` (12).** Groove never
+   clears `UNREAD` in Gmail, so unread mail piles up and the queue fills with
+   tickets agents closed days ago. Anything that has sat for half a day is
+   assumed handled. The check reads `internalDate` locally, so it runs before
+   the gate below, which costs an API call. A missing or unparseable
+   `internalDate` counts as stale.
+4. **A human agent already replied in the thread.** Every message the bot sends
    carries `X-Softorino-Bot: 1`. An outgoing message in the thread without that
    header was written by a person, so the bot stays out.
 
-Gate 3 exists because thread grouping cannot see this. A Groove ticket and a
+Stale mail is labelled *and* marked read. Left unread it would be re-listed on
+every run and crowd fresh mail out of `MAX_MESSAGES_SCANNED_PER_RUN`.
+
+Gate 4 exists because thread grouping cannot see this. A Groove ticket and a
 Gmail thread are not the same thing: an agent replying through Groove often
 lands outside the original conversation, so Gmail shows several threads where
 Groove shows one. Deduplication looked correct while the customer collected
 three different answers from "one" team.
 
-Two things follow from gate 3 and are intentional:
+Two things follow from gate 4 and are intentional:
 
 - Mail the bot sent before this header existed carries no stamp, so those
   threads now read as human-handled and the bot stays quiet in them.
@@ -231,12 +241,16 @@ Two things follow from gate 3 and are intentional:
   human-handled. One unanswered email is cheaper than a reply written over an
   agent in front of the customer.
 
-The run result reports `skipped_human_handled`, `skipped_service_mail` and
-`skipped_own_mail`.
+The run result reports `skipped_human_handled`, `skipped_service_mail`,
+`skipped_own_mail` and `skipped_stale`.
+
+`scripts/diagnose_agent_replies.py` is a read-only one-off that answers whether
+Groove-sent agent replies reach this mailbox at all. It needs the same three
+`GMAIL_*` variables the bot uses.
 
 ## Gmail label-based state tracking
 
-The bot creates and manages 6 Gmail labels to track processing state per
+The bot creates and manages 7 Gmail labels to track processing state per
 message and avoid duplicate customer replies across runs (e.g. if a run
 crashes after sending a reply but before marking the email read):
 
@@ -246,6 +260,7 @@ crashes after sending a reply but before marking the email read):
 - `AI_FAILED` — set if processing raises an error; the email is left unread so the next run retries it
 - `AI_SKIPPED_HUMAN` — a human agent had already replied in the thread
 - `AI_SKIPPED_SERVICE` — service mail, or mail from our own mailbox
+- `AI_SKIPPED_STALE` — older than `MAX_MESSAGE_AGE_HOURS` when the run reached it
 
 Any message that already carries `AI_REPLIED` or `AI_ESCALATED` is skipped
 entirely on future runs, even if it somehow reappears as unread.

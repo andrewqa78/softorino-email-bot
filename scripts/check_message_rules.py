@@ -34,6 +34,7 @@ import contextlib
 import io
 import os
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -473,6 +474,8 @@ def check_quote_stripping():
 # whether the customer is answered at all, whether ops is notified, and which
 # label the message ends up with. A unit test cannot see any of that.
 
+_UNSET = object()
+
 LABEL_IDS = {
     "processing": "L1",
     "replied": "L2",
@@ -480,6 +483,7 @@ LABEL_IDS = {
     "failed": "L4",
     "skipped_human": "L5",
     "skipped_service": "L6",
+    "skipped_stale": "L7",
 }
 ESCALATED_LABEL = LABEL_IDS["escalated"]
 OWN_MAILBOX = "support@softorino.app"
@@ -557,11 +561,22 @@ class FakeGmailService:
         return []
 
 
-def _incoming(body, subject="Refund", sender="Andrew Q <andrew@example.com>"):
+def _epoch_ms_hours_ago(hours):
+    return str(int((time.time() - hours * 3600) * 1000))
+
+
+def _incoming(
+    body,
+    subject="Refund",
+    sender="Andrew Q <andrew@example.com>",
+    age_hours=0.5,
+    internal_date=_UNSET,
+):
     raw = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii")
-    return {
+    message = {
         "id": "msg-1",
         "threadId": "t1",
+        "internalDate": _epoch_ms_hours_ago(age_hours),
         "payload": {
             "mimeType": "text/plain",
             "headers": [
@@ -572,6 +587,12 @@ def _incoming(body, subject="Refund", sender="Andrew Q <andrew@example.com>"):
             "body": {"data": raw},
         },
     }
+    if internal_date is not _UNSET:
+        if internal_date is None:
+            message.pop("internalDate")
+        else:
+            message["internalDate"] = internal_date
+    return message
 
 
 def _outgoing(msg_id, stamped):
@@ -590,12 +611,20 @@ def _escalated_thread():
     return {"messages": [{"id": "old", "labelIds": ["SENT", ESCALATED_LABEL]}]}
 
 
-def _run_message(body, subject="Refund", thread=None, sender="Andrew Q <andrew@example.com>"):
+def _run_message(
+    body,
+    subject="Refund",
+    thread=None,
+    sender="Andrew Q <andrew@example.com>",
+    age_hours=0.5,
+    internal_date=_UNSET,
+):
     service = FakeGmailService(thread)
     CLAUDE_CALLS.clear()
+    incoming = _incoming(body, subject, sender, age_hours, internal_date)
     result = _quiet(
         lambda: bot.process_single_message(
-            service, _incoming(body, subject, sender), True, LABEL_IDS, own_email=OWN_MAILBOX
+            service, incoming, True, LABEL_IDS, own_email=OWN_MAILBOX
         )
     )
     return service, result
@@ -837,6 +866,9 @@ def check_allowed_senders():
 # answering a stale request, so the ordering is asserted explicitly.
 
 
+_RECENT_BASE_MS = int((time.time() - 3600) * 1000)
+
+
 class FakeMailbox:
     """A Gmail stand-in complete enough to run process_unread_emails().
 
@@ -856,7 +888,10 @@ class FakeMailbox:
             self.store[msg_id] = {
                 "id": msg_id,
                 "threadId": thread_id,
-                "internalDate": str(internal_date),
+                # The fixtures give small numbers purely to order messages
+                # within a thread. Offset them to "an hour ago" so the age gate
+                # does not read every fixture as a 1970 message.
+                "internalDate": str(_RECENT_BASE_MS + int(internal_date)),
                 "labelIds": ["INBOX", "UNREAD"],
                 "subject": subject,
             }
@@ -1183,6 +1218,158 @@ def check_outgoing_stamp():
     return failures
 
 
+# --- message age -------------------------------------------------------------
+# Groove never clears UNREAD in Gmail, so the queue fills with tickets agents
+# closed days ago. Answering one of those is how the bot replied to Willie
+# Johnson about forwarding his case to billing, two days after an agent had
+# already refunded him.
+
+
+def check_message_age():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+
+    try:
+        expect(
+            f"the limit is {bot.MAX_MESSAGE_AGE_HOURS}h",
+            bot.MAX_MESSAGE_AGE_HOURS == 12,
+            f"MAX_MESSAGE_AGE_HOURS={bot.MAX_MESSAGE_AGE_HOURS}",
+        )
+
+        # 2 hours old: a live conversation, answer it.
+        service, result = _run_message(
+            "My app will not start", thread={"messages": []}, age_hours=2
+        )
+        expect(
+            "a 2 hour old message is processed",
+            result.get("processed") is True and service.customer_reply() is not None,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+
+        # 13 hours: past the limit.
+        service, result = _run_message(
+            "My app will not start", thread={"messages": []}, age_hours=13
+        )
+        expect(
+            "a 13 hour old message is stale",
+            result.get("skipped_reason") == "stale",
+            f"result={result!r}",
+        )
+        expect("a stale message gets no reply", service.customer_reply() is None)
+        expect("a stale message never reaches Claude", not CLAUDE_CALLS, f"{len(CLAUDE_CALLS)}")
+        expect(
+            "a stale message is labelled AI_SKIPPED_STALE",
+            service.added_labels() == [LABEL_IDS["skipped_stale"]],
+            f"added={service.added_labels()}",
+        )
+
+        # Exactly on the boundary: skip, so seconds of drift cannot flip it.
+        service, result = _run_message(
+            "My app will not start",
+            thread={"messages": []},
+            age_hours=bot.MAX_MESSAGE_AGE_HOURS,
+        )
+        expect(
+            "a message exactly at the limit is stale",
+            result.get("skipped_reason") == "stale",
+            f"result={result!r}",
+        )
+
+        # Just inside the boundary still gets answered.
+        service, result = _run_message(
+            "My app will not start",
+            thread={"messages": []},
+            age_hours=bot.MAX_MESSAGE_AGE_HOURS - 0.5,
+        )
+        expect(
+            "a message just under the limit is processed",
+            result.get("processed") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+
+        # internalDate missing, or garbage: fail closed.
+        for label, override in [
+            ("missing internalDate is stale", None),
+            ("unparseable internalDate is stale", "not-a-number"),
+            ("empty internalDate is stale", ""),
+            ("zero internalDate is stale", "0"),
+        ]:
+            service, result = _run_message(
+                "My app will not start", thread={"messages": []}, internal_date=override
+            )
+            expect(label, result.get("skipped_reason") == "stale", f"result={result!r}")
+            expect(f"{label}: no reply sent", service.customer_reply() is None)
+
+        # Gate order: service subject is checked before age, age before the
+        # human-in-thread lookup.
+        service, result = _run_message(
+            "A visitor started a chat",
+            subject="[AI Chat] New conversation",
+            thread={"messages": []},
+            age_hours=48,
+        )
+        expect(
+            "a stale service mail is still reported as service",
+            result.get("skipped_reason") == "service",
+            f"result={result!r}",
+        )
+        service, result = _run_message(
+            "Any update?",
+            thread={"messages": [_outgoing("agent-1", stamped=False)]},
+            age_hours=48,
+        )
+        expect(
+            "age is checked before the human-in-thread lookup",
+            result.get("skipped_reason") == "stale",
+            f"result={result!r}",
+        )
+
+        # Run level: the label lands, UNREAD is cleared, the counter reports it,
+        # and a fresh message beside it is still answered.
+        mailbox = FakeMailbox([("old1", "told", 1000, "Old ticket")])
+        mailbox.store["old1"]["internalDate"] = _epoch_ms_hours_ago(30)
+        result = _run(mailbox)
+        expect(
+            "the run counts stale mail separately",
+            result.get("skipped_stale") == 1,
+            f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+        )
+        expect(
+            "a stale message loses UNREAD and gains AI_SKIPPED_STALE",
+            "UNREAD" not in mailbox.labels_of("old1")
+            and "id-AI_SKIPPED_STALE" in mailbox.labels_of("old1"),
+            f"labels={mailbox.labels_of('old1')}",
+        )
+        expect("a stale message is not replied to", not mailbox.created_drafts)
+
+        mailbox = FakeMailbox([
+            ("old1", "told", 1000, "Old ticket"),
+            ("new1", "tnew", 1000, "Fresh ticket"),
+        ])
+        mailbox.store["old1"]["internalDate"] = _epoch_ms_hours_ago(30)
+        result = _run(mailbox)
+        expect(
+            "a fresh message beside a stale one is still answered",
+            result.get("skipped_stale") == 1 and len(mailbox.created_drafts) == 1,
+            f"stale={result.get('skipped_stale')}, drafts={len(mailbox.created_drafts)}",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
 def check_thread_grouping():
     failures = []
 
@@ -1362,6 +1549,9 @@ def main():
     print("\nHuman agents and service mail:")
     failures += check_human_and_service_gates()
 
+    print("\nMessage age:")
+    failures += check_message_age()
+
     print("\nThread grouping:")
     failures += check_thread_grouping()
 
@@ -1379,6 +1569,7 @@ def main():
         + 14  # thread grouping
         + 2   # outgoing stamp
         + 31  # human / service gates
+        + 21  # message age
         + 5  # quote stripping
     )
     if failures:
