@@ -72,6 +72,12 @@ SERVICE_SUBJECT_TERMS = [
 BOT_HEADER_NAME = "X-Softorino-Bot"
 BOT_HEADER_VALUE = "1"
 
+# Groove rewrites Message-ID/References, so an agent's reply often lands outside
+# the customer's Gmail thread -- sometimes as its own thread. Looking the
+# customer's address up directly sidesteps threading altogether.
+AGENT_SEARCH_WINDOW_DAYS = 14
+AGENT_SEARCH_MAX_RESULTS = 20
+
 # ---------------------------------------------------------------------------
 # TEMPORARY -- diagnostic mode. Delete this block, run_mailbox_diagnostic() and
 # the branch at the top of process_unread_emails() once the question it answers
@@ -423,47 +429,127 @@ def is_service_subject(subject):
     return any(term in normalised for term in SERVICE_SUBJECT_TERMS)
 
 
+def is_agent_message(headers):
+    """True when an outgoing message was written by a person.
+
+    Two things go out of this mailbox that are not agents. The bot stamps its
+    own mail with X-Softorino-Bot. The autoresponder ("Your Softorino support
+    request has been received") does not -- and it goes to every customer, so
+    treating "unstamped" as "agent" on its own would mark every single ticket
+    as human-handled and the bot would stop answering anyone at all. Three of
+    the six agent replies the mailbox diagnostic found were this autoresponder.
+
+    Callers must already know the message is outgoing; this only rules out the
+    two automated senders. The subject lists it reuses are the same ones the
+    service-mail gate matches on.
+    """
+    if header_value(headers, BOT_HEADER_NAME):
+        return False
+    if is_service_subject(header_value(headers, "Subject")):
+        return False
+    return True
+
+
 def thread_has_human_reply(service, thread_id, own_email):
-    """True when a person -- not this bot -- has already answered in the thread.
+    """Describe the agent reply already in this thread, or None if there is none.
 
-    Groove sends an agent's reply outside the original Gmail conversation, so
-    Gmail shows several threads where Groove shows one. Thread grouping
-    therefore cannot see that an agent is already handling the ticket, which is
-    how a customer ended up with an agent's instructions and two contradicting
-    bot replies on top.
+    Returns a dict naming the message that triggered the match, so a run can be
+    audited: without the id and subject there is no telling "the gate works"
+    apart from "the gate is silencing everything".
 
-    The signal used instead is the X-Softorino-Bot header: every outgoing
-    message the bot sends carries it. An outgoing message without it was written
-    by a person.
-
-    A thread that cannot be read is treated as human-handled. Staying quiet
-    costs one unanswered email; guessing wrong costs a reply written over an
-    agent in front of the customer.
+    A thread that cannot be read counts as human-handled. Staying quiet costs
+    one unanswered email; guessing wrong costs a reply written over an agent in
+    front of the customer.
     """
     if not thread_id:
-        return False
+        return None
     if not own_email:
         print("[HUMAN-CHECK] Own mailbox address unknown — assuming a human is handling this.")
-        return True
+        return {"source": "thread", "message_id": "", "subject": "(own address unknown)"}
 
     try:
         thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
     except Exception as error:
         print(f"[HUMAN-CHECK] FAILED to read thread {thread_id}: {error} — assuming human-handled.")
-        return True
+        return {"source": "thread", "message_id": "", "subject": f"(thread unreadable: {error})"}
 
     for thread_message in thread.get("messages", []):
         headers = thread_message.get("payload", {}).get("headers", [])
         if not is_own_address(header_value(headers, "From"), own_email):
             continue
         msg_id = thread_message.get("id")
-        if header_value(headers, BOT_HEADER_NAME):
-            print(f"[HUMAN-CHECK] Message {msg_id}: outgoing, stamped by the bot")
+        subject = header_value(headers, "Subject")
+        if not is_agent_message(headers):
+            print(f"[HUMAN-CHECK] Message {msg_id}: outgoing but automated ({subject!r})")
             continue
-        print(f"[HUMAN-CHECK] Message {msg_id}: outgoing WITHOUT {BOT_HEADER_NAME} — a human replied here")
-        return True
+        print(f"[HUMAN-CHECK] Message {msg_id}: outgoing agent reply ({subject!r})")
+        return {"source": "thread", "message_id": msg_id, "subject": subject}
 
-    return False
+    return None
+
+
+def agent_replied_to_address(service, own_email, customer_email, cache=None):
+    """Has a person written to this customer in the last fortnight, anywhere?
+
+    The thread check only sees replies Gmail managed to thread. Groove rewrites
+    the threading headers, so an agent's reply frequently is not in the
+    customer's thread at all -- which is how the bot offered to forward Willie
+    Johnson's case to billing two days after an agent had refunded him.
+
+    Returns (match_or_None, check_failed). A failed lookup is reported
+    separately rather than folded into "a human replied", so a broken query
+    cannot masquerade as the gate working.
+    """
+    key = (customer_email or "").strip().lower()
+    if cache is not None and key in cache:
+        print(f"[AGENT-SEARCH] {key}: cached")
+        return cache[key]
+
+    result = (None, False)
+    try:
+        query = (
+            f"from:{own_email} to:{key} newer_than:{AGENT_SEARCH_WINDOW_DAYS}d"
+        )
+        listing = (
+            service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=AGENT_SEARCH_MAX_RESULTS)
+            .execute()
+        )
+        refs = listing.get("messages", [])
+        print(f"[AGENT-SEARCH] {key}: {len(refs)} outgoing message(s) in the window")
+        for ref in refs:
+            message = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=ref["id"],
+                    format="metadata",
+                    metadataHeaders=["Subject", BOT_HEADER_NAME],
+                )
+                .execute()
+            )
+            headers = message.get("payload", {}).get("headers", [])
+            subject = header_value(headers, "Subject")
+            if not is_agent_message(headers):
+                continue
+            # First hit is enough -- nothing later can change the answer.
+            print(f"[AGENT-SEARCH] {key}: agent reply {ref['id']} ({subject!r})")
+            result = (
+                {"source": "address_search", "message_id": ref["id"], "subject": subject},
+                False,
+            )
+            break
+        else:
+            print(f"[AGENT-SEARCH] {key}: no agent reply found")
+    except Exception as error:
+        print(f"[AGENT-SEARCH] {key}: FAILED ({error}) — skipping rather than answering.")
+        result = (None, True)
+
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def thread_already_escalated(service, thread_id, escalated_label_id):
@@ -1117,8 +1203,12 @@ def run_mailbox_diagnostic(service, addresses):
         # Outgoing = addressed to the customer but not written by them.
         outgoing = [row for row in to_rows if normalised not in (row["from"] or "").lower()]
         bot_sent = [row for row in outgoing if row["bot_header"]]
-        # No X-Softorino-Bot on an outgoing message means a person wrote it.
-        agent_sent = [row for row in outgoing if not row["bot_header"]]
+        # Unstamped is not enough on its own: the autoresponder goes out to
+        # every customer without the header either. Same subject lists the
+        # service-mail gate uses.
+        unstamped = [row for row in outgoing if not row["bot_header"]]
+        auto_sent = [row for row in unstamped if is_service_subject(row["subject"])]
+        agent_sent = [row for row in unstamped if not is_service_subject(row["subject"])]
         agent_replies_total += len(agent_sent)
 
         customer_threads = {row["threadId"] for row in from_rows if row["threadId"]}
@@ -1153,6 +1243,7 @@ def run_mailbox_diagnostic(service, addresses):
             "verdict": {
                 "agent_replies_found": len(agent_sent),
                 "bot_replies_found": len(bot_sent),
+                "autoresponder_found": len(auto_sent),
                 "customer_messages_found": len(from_rows),
                 "customer_thread_ids": sorted(customer_threads),
                 "agent_thread_ids": sorted(agent_threads),
@@ -1240,7 +1331,13 @@ def process_unread_emails():
 
     results = []
     skipped_older_count = 0
-    skip_counts = {"human": 0, "service": 0, "self": 0, "stale": 0}
+    skip_counts = {"human": 0, "service": 0, "self": 0, "stale": 0, "human_check_failed": 0}
+    # One lookup per customer per run: two messages from the same person must
+    # not cost the same 21 API calls twice.
+    agent_search_cache = {}
+    # Every human-gate hit, with the message that triggered it. Without this
+    # there is no telling "the gate works" from "the gate silences everything".
+    human_gate_hits = []
     for index, (thread_id, group) in enumerate(thread_groups):
         if index > 0:
             time.sleep(DELAY_BETWEEN_EMAILS_SECONDS)
@@ -1279,11 +1376,28 @@ def process_unread_emails():
 
         try:
             single_result = process_single_message(
-                service, message, dry_run, label_ids, own_email=own_email
+                service,
+                message,
+                dry_run,
+                label_ids,
+                own_email=own_email,
+                agent_search_cache=agent_search_cache,
             )
             skip_reason = single_result.get("skipped_reason")
             if skip_reason:
                 skip_counts[skip_reason] = skip_counts.get(skip_reason, 0) + 1
+            if skip_reason in ("human", "human_check_failed"):
+                human_gate_hits.append(
+                    {
+                        "message_id": message["id"],
+                        "subject": single_result.get("subject", ""),
+                        "customer": single_result.get("customer", ""),
+                        "reason": skip_reason,
+                        "matched_by": single_result.get("matched_by", ""),
+                        "matched_message_id": single_result.get("matched_message_id", ""),
+                        "matched_subject": single_result.get("matched_subject", ""),
+                    }
+                )
             skipped_older = _settle_older_thread_messages(
                 service, older_refs, label_ids, single_result.get("label_key")
             )
@@ -1315,6 +1429,8 @@ def process_unread_emails():
         "skipped_service_mail": skip_counts["service"],
         "skipped_own_mail": skip_counts["self"],
         "skipped_stale": skip_counts["stale"],
+        "human_check_failed": skip_counts["human_check_failed"],
+        "human_gate_hits": human_gate_hits,
         "results": results,
     }
 
@@ -1340,7 +1456,9 @@ def _deliver_customer_reply(service, message, sender, subject, reply, dry_run):
     return deliver_reply(service, draft_message, message.get("threadId"), dry_run)
 
 
-def process_single_message(service, message, dry_run, label_ids, own_email=""):
+def process_single_message(
+    service, message, dry_run, label_ids, own_email="", agent_search_cache=None
+):
     headers = message.get("payload", {}).get("headers", [])
     sender = header_value(headers, "Reply-To") or header_value(headers, "From")
     subject = header_value(headers, "Subject") or "(no subject)"
@@ -1392,15 +1510,59 @@ def process_single_message(service, message, dry_run, label_ids, own_email=""):
         }
 
     # -- Gate 4: a human agent is already answering in this thread.
-    if thread_has_human_reply(service, message.get("threadId"), own_email):
-        print(f"[SKIP] Message {message['id']}: a human agent has replied in this thread.")
+    thread_match = thread_has_human_reply(service, message.get("threadId"), own_email)
+    if thread_match:
+        print(
+            f"[SKIP] Message {message['id']}: a human agent has replied in this thread "
+            f"({thread_match['message_id']!r} {thread_match['subject']!r})."
+        )
         _finalize_message_labels(service, message["id"], label_ids, "skipped_human")
         return {
             "processed": False,
             "label_key": "skipped_human",
             "skipped_reason": "human",
             "subject": subject,
+            "matched_by": thread_match["source"],
+            "matched_message_id": thread_match["message_id"],
+            "matched_subject": thread_match["subject"],
             "message": "A human agent is handling this thread. Skipped, no reply.",
+        }
+
+    # -- Gate 5: a human agent has written to this customer recently, in any
+    # thread at all. Groove rewrites the threading headers, so gate 4 simply
+    # cannot see most agent replies. Last gate before anything expensive: the
+    # reply generation below is the Claude call.
+    customer_address = parseaddr(sender)[1] or sender
+    agent_match, check_failed = agent_replied_to_address(
+        service, own_email, customer_address, agent_search_cache
+    )
+    if check_failed:
+        print(f"[SKIP] Message {message['id']}: agent lookup failed — skipping rather than answering.")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_human")
+        return {
+            "processed": False,
+            "label_key": "skipped_human",
+            "skipped_reason": "human_check_failed",
+            "subject": subject,
+            "customer": customer_address,
+            "message": "Could not check for agent involvement. Skipped, no reply.",
+        }
+    if agent_match:
+        print(
+            f"[SKIP] Message {message['id']}: an agent wrote to {customer_address} recently "
+            f"({agent_match['message_id']!r} {agent_match['subject']!r})."
+        )
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_human")
+        return {
+            "processed": False,
+            "label_key": "skipped_human",
+            "skipped_reason": "human",
+            "subject": subject,
+            "customer": customer_address,
+            "matched_by": agent_match["source"],
+            "matched_message_id": agent_match["message_id"],
+            "matched_subject": agent_match["subject"],
+            "message": "A human agent is handling this customer. Skipped, no reply.",
         }
 
     # Message-ID/References are read by _deliver_customer_reply() from the same

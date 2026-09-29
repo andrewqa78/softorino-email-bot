@@ -504,9 +504,12 @@ class FakeGmailService:
     checks can tell a customer reply from an ops notification.
     """
 
-    def __init__(self, thread=None):
+    def __init__(self, thread=None, agent_search_rows=None):
         self.actions = []
         self._thread = thread or {"messages": []}
+        # What "from:us to:customer" finds. Each row: {"id", "subject", "stamped"}.
+        self.agent_search_rows = list(agent_search_rows or [])
+        self.search_queries = []
 
     # -- api surface --
     def users(self):
@@ -533,8 +536,19 @@ class FakeGmailService:
         self.actions.append(("modify", body))
         return _Call({})
 
-    def get(self, userId=None, id=None, format=None):
-        return _Call(self._thread)
+    def list(self, userId=None, q=None, maxResults=None):
+        self.search_queries.append(q)
+        return _Call({"messages": [{"id": row["id"]} for row in self.agent_search_rows]})
+
+    def get(self, userId=None, id=None, format=None, metadataHeaders=None):
+        # format="metadata" is the agent search; format="full" is the thread read.
+        if format != "metadata":
+            return _Call(self._thread)
+        row = next(r for r in self.agent_search_rows if r["id"] == id)
+        headers = [{"name": "Subject", "value": row.get("subject", "")}]
+        if row.get("stamped"):
+            headers.append({"name": bot.BOT_HEADER_NAME, "value": bot.BOT_HEADER_VALUE})
+        return _Call({"id": id, "payload": {"headers": headers}})
 
     def getProfile(self, userId=None):
         return _Call({"emailAddress": OWN_MAILBOX})
@@ -618,13 +632,20 @@ def _run_message(
     sender="Andrew Q <andrew@example.com>",
     age_hours=0.5,
     internal_date=_UNSET,
+    agent_search_rows=None,
+    cache=None,
 ):
-    service = FakeGmailService(thread)
+    service = FakeGmailService(thread, agent_search_rows)
     CLAUDE_CALLS.clear()
     incoming = _incoming(body, subject, sender, age_hours, internal_date)
     result = _quiet(
         lambda: bot.process_single_message(
-            service, incoming, True, LABEL_IDS, own_email=OWN_MAILBOX
+            service,
+            incoming,
+            True,
+            LABEL_IDS,
+            own_email=OWN_MAILBOX,
+            agent_search_cache=cache,
         )
     )
     return service, result
@@ -896,6 +917,7 @@ class FakeMailbox:
                 "subject": subject,
             }
         self.created_drafts = []
+        self.agent_search_rows = []
         self.thread_messages = []
         self.sender = "Angry Customer <angry@example.com>"
         self.sent = []
@@ -942,9 +964,18 @@ class _MailboxMessages:
 
     def list(self, userId=None, q=None, maxResults=None):
         self.mb.list_calls.append({"q": q, "maxResults": maxResults})
+        # "from:us to:customer ..." is the agent lookup, not the unread queue.
+        if (q or "").startswith(f"from:{OWN_MAILBOX}"):
+            return _Call({"messages": [{"id": r["id"]} for r in self.mb.agent_search_rows]})
         return _Call({"messages": self.mb.refs[:maxResults]})
 
-    def get(self, userId=None, id=None, format=None):
+    def get(self, userId=None, id=None, format=None, metadataHeaders=None):
+        if format == "metadata":
+            row = next(r for r in self.mb.agent_search_rows if r["id"] == id)
+            headers = [{"name": "Subject", "value": row.get("subject", "")}]
+            if row.get("stamped"):
+                headers.append({"name": bot.BOT_HEADER_NAME, "value": bot.BOT_HEADER_VALUE})
+            return _Call({"id": id, "payload": {"headers": headers}})
         stored = self.mb.store[id]
         common = {
             "id": stored["id"],
@@ -1169,13 +1200,24 @@ def check_human_and_service_gates():
 
         broken = BrokenThreads({"messages": []})
         CLAUDE_CALLS.clear()
+        # The check now returns the match it found rather than a bare True, so
+        # a run can be audited. Both failure modes still count as human-handled.
+        unreadable = _quiet(lambda: bot.thread_has_human_reply(broken, "t1", OWN_MAILBOX))
         expect(
             "an unreadable thread is treated as human-handled",
-            _quiet(lambda: bot.thread_has_human_reply(broken, "t1", OWN_MAILBOX)) is True,
+            bool(unreadable) and "unreadable" in unreadable["subject"],
+            f"got {unreadable!r}",
         )
+        unknown_own = _quiet(lambda: bot.thread_has_human_reply(FakeGmailService(), "t1", ""))
         expect(
             "an unknown own address is treated as human-handled",
-            _quiet(lambda: bot.thread_has_human_reply(FakeGmailService(), "t1", "")) is True,
+            bool(unknown_own),
+            f"got {unknown_own!r}",
+        )
+        expect(
+            "a thread with no agent reply returns None",
+            _quiet(lambda: bot.thread_has_human_reply(FakeGmailService(), "t1", OWN_MAILBOX))
+            is None,
         )
     finally:
         bot.build_knowledge_base = original_kb
@@ -1223,6 +1265,232 @@ def check_outgoing_stamp():
 # closed days ago. Answering one of those is how the bot replied to Willie
 # Johnson about forwarding his case to billing, two days after an agent had
 # already refunded him.
+
+
+# --- agent lookup by customer address ---------------------------------------
+# Groove rewrites the threading headers, so most agent replies never land in the
+# customer's Gmail thread and the thread check cannot see them. The lookup below
+# asks a different question: has a person written to this customer at all?
+#
+# The trap the mailbox diagnostic exposed: the autoresponder ("Your Softorino
+# support request has been received") also goes out unstamped, to every single
+# customer. Counting it as an agent would mark every ticket human-handled and
+# the bot would answer nobody.
+
+AUTORESPONDER = {
+    "id": "auto-1",
+    "subject": "Your Softorino support request has been received \u2764\ufe0f",
+    "stamped": False,
+}
+AGENT_MAIL = {"id": "agent-1", "subject": "Re: unable to activate folder colorizer", "stamped": False}
+BOT_MAIL = {"id": "bot-1", "subject": "Re: Crash on launch", "stamped": True}
+QUIDGET_MAIL = {"id": "quidget-1", "subject": "[AI Chat] New conversation", "stamped": False}
+
+
+def check_agent_lookup():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+
+    def run(rows, **kwargs):
+        return _run_message(
+            "My app will not start",
+            thread={"messages": []},
+            agent_search_rows=rows,
+            **kwargs,
+        )
+
+    try:
+        # -- the autoresponder trap --
+        service, result = run([AUTORESPONDER])
+        expect(
+            "only the autoresponder found: still answered",
+            result.get("processed") is True and service.customer_reply() is not None,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+        service, result = run([AUTORESPONDER, AGENT_MAIL])
+        expect(
+            "autoresponder plus a real agent reply: treated as human",
+            result.get("skipped_reason") == "human",
+            f"result={result!r}",
+        )
+        expect(
+            "the agent message is named, not the autoresponder",
+            result.get("matched_message_id") == "agent-1",
+            f"matched={result.get('matched_message_id')!r}",
+        )
+        service, result = run([BOT_MAIL, AUTORESPONDER])
+        expect(
+            "bot reply plus autoresponder: still answered",
+            result.get("processed") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+        service, result = run([QUIDGET_MAIL])
+        expect(
+            "an unstamped [AI Chat] message is not an agent",
+            result.get("processed") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+
+        # -- the plain cases from the brief --
+        service, result = run([AGENT_MAIL])
+        expect(
+            "an unstamped agent reply means human",
+            result.get("skipped_reason") == "human" and service.customer_reply() is None,
+            f"result={result!r}",
+        )
+        expect("a human-gate hit sends nothing", service.customer_reply() is None)
+        expect("a human-gate hit never calls Claude", not CLAUDE_CALLS, f"{len(CLAUDE_CALLS)}")
+        expect(
+            "a human-gate hit is labelled AI_SKIPPED_HUMAN",
+            service.added_labels() == [LABEL_IDS["skipped_human"]],
+            f"added={service.added_labels()}",
+        )
+        expect(
+            "the match is reported for audit",
+            result.get("matched_by") == "address_search"
+            and result.get("matched_subject") == AGENT_MAIL["subject"]
+            and result.get("customer") == "andrew@example.com",
+            f"result={result!r}",
+        )
+
+        service, result = run([BOT_MAIL])
+        expect(
+            "only stamped bot replies: processed",
+            result.get("processed") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+        service, result = run([])
+        expect("nothing found: processed", result.get("processed") is True)
+
+        # -- the query itself --
+        expect(
+            "the lookup asks from:us to:customer over 14 days",
+            service.search_queries
+            == [f"from:{OWN_MAILBOX} to:andrew@example.com newer_than:14d"],
+            f"queries={service.search_queries}",
+        )
+
+        # -- a failed lookup must not become a reply --
+        class BrokenSearch(FakeGmailService):
+            def list(self, userId=None, q=None, maxResults=None):
+                raise RuntimeError("Gmail is having a moment")
+
+        broken = BrokenSearch({"messages": []})
+        CLAUDE_CALLS.clear()
+        result = _quiet(
+            lambda: bot.process_single_message(
+                broken,
+                _incoming("My app will not start"),
+                True,
+                LABEL_IDS,
+                own_email=OWN_MAILBOX,
+            )
+        )
+        expect(
+            "a failed lookup reports human_check_failed",
+            result.get("skipped_reason") == "human_check_failed",
+            f"result={result!r}",
+        )
+        expect("a failed lookup sends nothing", broken.customer_reply() is None)
+        expect("a failed lookup never calls Claude", not CLAUDE_CALLS)
+        expect(
+            "a failed lookup is not counted as a real human hit",
+            result.get("skipped_reason") != "human",
+        )
+
+        # -- caching: two messages from one customer, one lookup --
+        cache = {}
+        first, _ = run([AGENT_MAIL], cache=cache)
+        second, _ = run([AGENT_MAIL], cache=cache)
+        expect(
+            "the same customer is looked up once per run",
+            len(first.search_queries) == 1 and second.search_queries == [],
+            f"first={first.search_queries}, second={second.search_queries}",
+        )
+
+        # -- gate order: the thread check still wins when it matches --
+        service, result = _run_message(
+            "My app will not start",
+            thread={"messages": [_outgoing("in-thread", stamped=False)]},
+            agent_search_rows=[AGENT_MAIL],
+        )
+        expect(
+            "the thread check is credited when it matches first",
+            result.get("matched_by") == "thread",
+            f"result={result!r}",
+        )
+
+        # -- the thread check must ignore the autoresponder too --
+        service, result = _run_message(
+            "My app will not start",
+            thread={
+                "messages": [
+                    {
+                        "id": "auto-in-thread",
+                        "labelIds": ["SENT"],
+                        "payload": {
+                            "mimeType": "text/plain",
+                            "headers": [
+                                {"name": "From", "value": f"Softorino <{OWN_MAILBOX}>"},
+                                {"name": "Subject", "value": AUTORESPONDER["subject"]},
+                            ],
+                            "body": {"data": ""},
+                        },
+                    }
+                ]
+            },
+            agent_search_rows=[],
+        )
+        expect(
+            "an autoresponder inside the thread is not a human either",
+            result.get("processed") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+
+        # -- run level: counters and the audit list --
+        mailbox = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+        mailbox.agent_search_rows = [AGENT_MAIL]
+        run_result = _run(mailbox)
+        expect(
+            "the run counts the human gate",
+            run_result.get("skipped_human_handled") == 1 and not mailbox.created_drafts,
+            f"result={ {k: v for k, v in run_result.items() if k != 'results'} }",
+        )
+        hits = run_result.get("human_gate_hits") or []
+        expect(
+            "the run lists the id and subject that triggered it",
+            len(hits) == 1
+            and hits[0]["matched_message_id"] == "agent-1"
+            and hits[0]["matched_subject"] == AGENT_MAIL["subject"]
+            and hits[0]["message_id"] == "m1",
+            f"hits={hits}",
+        )
+
+        mailbox = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+        mailbox.agent_search_rows = [AUTORESPONDER]
+        run_result = _run(mailbox)
+        expect(
+            "a run where only the autoresponder exists still answers",
+            run_result.get("skipped_human_handled") == 0
+            and len(mailbox.created_drafts) == 1,
+            f"result={ {k: v for k, v in run_result.items() if k != 'results'} }, "
+            f"drafts={len(mailbox.created_drafts)}",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
 
 
 def check_message_age():
@@ -1806,6 +2074,9 @@ def main():
     print("\nDiagnostic mode (temporary):")
     failures += check_diagnostic_mode()
 
+    print("\nAgent lookup by address:")
+    failures += check_agent_lookup()
+
     print("\nMessage age:")
     failures += check_message_age()
 
@@ -1825,9 +2096,10 @@ def main():
         + 13  # end to end
         + 14  # thread grouping
         + 2   # outgoing stamp
-        + 31  # human / service gates
+        + 32  # human / service gates
         + 21  # message age
         + 18  # diagnostic mode
+        + 23  # agent lookup
         + 5  # quote stripping
     )
     if failures:

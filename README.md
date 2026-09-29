@@ -203,7 +203,7 @@ matter: bare substrings are what caused both bugs.
 
 ## Never talking over a person
 
-Four gates run before anything else, in this order. Each one labels the message
+Five gates run before anything else, in this order. Each one labels the message
 and returns. Nothing is sent to the customer and Claude is never called.
 
 1. **Mail from our own mailbox.** `From` matching the authenticated account is
@@ -222,10 +222,30 @@ and returns. Nothing is sent to the customer and Claude is never called.
    `internalDate` counts as stale.
 4. **A human agent already replied in the thread.** Every message the bot sends
    carries `X-Softorino-Bot: 1`. An outgoing message in the thread without that
-   header was written by a person, so the bot stays out.
+   header, and without a service subject, was written by a person.
+5. **A human agent wrote to this customer recently, in any thread.** Searches
+   `from:<us> to:<customer> newer_than:14d`, up to 20 results, and stops at the
+   first agent message. Last gate before the Claude call. Results are cached per
+   address for the run, so two messages from one customer cost one lookup. A
+   failed lookup skips the message and is reported as `human_check_failed`, kept
+   apart from real hits so a broken query cannot pass for the gate working.
 
 Stale mail is labelled *and* marked read. Left unread it would be re-listed on
 every run and crowd fresh mail out of `MAX_MESSAGES_SCANNED_PER_RUN`.
+
+### What counts as an agent
+
+`is_agent_message()` is the one place that decides, and both gate 4 and gate 5
+use it. An outgoing message is an agent's only when it has **no**
+`X-Softorino-Bot` header **and** its subject is not service mail.
+
+The second condition is not optional. The autoresponder ("Your Softorino support
+request has been received") goes out from the same address, unstamped, to every
+customer. On "unstamped means agent" alone, every ticket would look
+human-handled and the bot would answer nobody -- three of the six apparent agent
+replies the mailbox diagnostic found were exactly this. It reuses
+`SERVICE_SUBJECT_PREFIXES` and `SERVICE_SUBJECT_TERMS`, the same lists gate 2
+matches on.
 
 Gate 4 exists because thread grouping cannot see this. A Groove ticket and a
 Gmail thread are not the same thing: an agent replying through Groove often
@@ -242,7 +262,11 @@ Two things follow from gate 4 and are intentional:
   agent in front of the customer.
 
 The run result reports `skipped_human_handled`, `skipped_service_mail`,
-`skipped_own_mail` and `skipped_stale`.
+`skipped_own_mail`, `skipped_stale` and `human_check_failed`, plus
+`human_gate_hits`: one entry per human-gate hit naming the message that
+triggered it, which gate matched and the id and subject it matched against.
+Without that list there is no way to tell the gate working from the gate
+silencing everything.
 
 ### Diagnostic mode (temporary)
 
