@@ -473,8 +473,16 @@ def check_quote_stripping():
 # whether the customer is answered at all, whether ops is notified, and which
 # label the message ends up with. A unit test cannot see any of that.
 
-LABEL_IDS = {"processing": "L1", "replied": "L2", "escalated": "L3", "failed": "L4"}
+LABEL_IDS = {
+    "processing": "L1",
+    "replied": "L2",
+    "escalated": "L3",
+    "failed": "L4",
+    "skipped_human": "L5",
+    "skipped_service": "L6",
+}
 ESCALATED_LABEL = LABEL_IDS["escalated"]
+OWN_MAILBOX = "support@softorino.app"
 
 
 class _Call:
@@ -524,6 +532,9 @@ class FakeGmailService:
     def get(self, userId=None, id=None, format=None):
         return _Call(self._thread)
 
+    def getProfile(self, userId=None):
+        return _Call({"emailAddress": OWN_MAILBOX})
+
     # -- assertions helpers --
     def customer_reply(self):
         """The reply to the customer: the draft, in DRY_RUN."""
@@ -546,7 +557,7 @@ class FakeGmailService:
         return []
 
 
-def _incoming(body, subject="Refund"):
+def _incoming(body, subject="Refund", sender="Andrew Q <andrew@example.com>"):
     raw = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii")
     return {
         "id": "msg-1",
@@ -554,7 +565,7 @@ def _incoming(body, subject="Refund"):
         "payload": {
             "mimeType": "text/plain",
             "headers": [
-                {"name": "From", "value": "Andrew Q <andrew@example.com>"},
+                {"name": "From", "value": sender},
                 {"name": "Subject", "value": subject},
                 {"name": "Message-ID", "value": "<abc@mail>"},
             ],
@@ -563,15 +574,29 @@ def _incoming(body, subject="Refund"):
     }
 
 
+def _outgoing(msg_id, stamped):
+    """A message in the thread sent from our own mailbox, bot-stamped or not."""
+    headers = [{"name": "From", "value": f"Softorino Support <{OWN_MAILBOX}>"}]
+    if stamped:
+        headers.append({"name": bot.BOT_HEADER_NAME, "value": bot.BOT_HEADER_VALUE})
+    return {
+        "id": msg_id,
+        "labelIds": ["SENT"],
+        "payload": {"mimeType": "text/plain", "headers": headers, "body": {"data": ""}},
+    }
+
+
 def _escalated_thread():
     return {"messages": [{"id": "old", "labelIds": ["SENT", ESCALATED_LABEL]}]}
 
 
-def _run_message(body, subject="Refund", thread=None):
+def _run_message(body, subject="Refund", thread=None, sender="Andrew Q <andrew@example.com>"):
     service = FakeGmailService(thread)
     CLAUDE_CALLS.clear()
     result = _quiet(
-        lambda: bot.process_single_message(service, _incoming(body, subject), True, LABEL_IDS)
+        lambda: bot.process_single_message(
+            service, _incoming(body, subject, sender), True, LABEL_IDS, own_email=OWN_MAILBOX
+        )
     )
     return service, result
 
@@ -836,6 +861,8 @@ class FakeMailbox:
                 "subject": subject,
             }
         self.created_drafts = []
+        self.thread_messages = []
+        self.sender = "Angry Customer <angry@example.com>"
         self.sent = []
         self.modifies = []
         self.list_calls = []
@@ -857,6 +884,9 @@ class FakeMailbox:
     # -- api surface --
     def users(self):
         return self
+
+    def getProfile(self, userId=None):
+        return _Call({"emailAddress": OWN_MAILBOX})
 
     def messages(self):
         return _MailboxMessages(self)
@@ -895,7 +925,7 @@ class _MailboxMessages:
         common["payload"] = {
             "mimeType": "text/plain",
             "headers": [
-                {"name": "From", "value": "Angry Customer <angry@example.com>"},
+                {"name": "From", "value": self.mb.sender},
                 {"name": "Subject", "value": stored["subject"]},
                 {"name": "Message-ID", "value": f"<{stored['id']}@mail>"},
             ],
@@ -941,7 +971,7 @@ class _MailboxThreads:
         self.mb = mailbox
 
     def get(self, userId=None, id=None, format=None):
-        return _Call({"messages": []})
+        return _Call({"messages": self.mb.thread_messages})
 
 
 @contextlib.contextmanager
@@ -968,6 +998,189 @@ def _run(mailbox):
     CLAUDE_CALLS.clear()
     with _run_environment(mailbox):
         return _quiet(bot.process_unread_emails)
+
+
+# --- not talking over people ------------------------------------------------
+# On production the bot answered on top of agents Chloe and Alex, and replied to
+# its own autoresponder with its internal reasoning. Groove sends an agent's
+# reply outside the original Gmail conversation, so thread grouping cannot see
+# the agent at all -- the signal is the X-Softorino-Bot header on outgoing mail.
+AUTORESPONDER_SUBJECT = "Your Softorino support request has been received"
+
+
+def check_human_and_service_gates():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+
+    def silent(service, result, label, expected_reason, expected_label):
+        expect(
+            f"{label}: nothing is sent to the customer",
+            service.customer_reply() is None,
+            f"reply={service.customer_reply()!r}",
+        )
+        expect(f"{label}: Claude is not called", not CLAUDE_CALLS, f"{len(CLAUDE_CALLS)} call(s)")
+        expect(
+            f"{label}: labelled {expected_label}",
+            service.added_labels() == [LABEL_IDS[expected_label]],
+            f"added={service.added_labels()}",
+        )
+        expect(
+            f"{label}: reported as {expected_reason}",
+            result.get("skipped_reason") == expected_reason and result.get("processed") is False,
+            f"result={result!r}",
+        )
+
+    try:
+        # 1. An agent replied in the thread -- outgoing message with no stamp.
+        service, result = _run_message(
+            "Any update on this?",
+            thread={"messages": [_outgoing("agent-1", stamped=False)]},
+        )
+        silent(service, result, "human in thread", "human", "skipped_human")
+
+        # 2. Only the bot has replied -- every outgoing message is stamped.
+        service, result = _run_message(
+            "Any update on this?",
+            thread={"messages": [_outgoing("bot-1", stamped=True)]},
+        )
+        expect(
+            "bot-only thread is answered as usual",
+            result.get("processed") is True and service.customer_reply() is not None,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+
+        # 2b. Mixed: one stamped, one not. One human message is enough.
+        service, result = _run_message(
+            "Any update on this?",
+            thread={
+                "messages": [_outgoing("bot-1", stamped=True), _outgoing("agent-1", stamped=False)]
+            },
+        )
+        expect(
+            "one unstamped message among stamped ones still counts as human",
+            result.get("skipped_reason") == "human" and service.customer_reply() is None,
+            f"result={result!r}",
+        )
+
+        # 3. A brand new enquiry: no outgoing messages at all.
+        service, result = _run_message("My app will not start", thread={"messages": []})
+        expect(
+            "new enquiry with no outgoing mail is answered",
+            result.get("processed") is True and service.customer_reply() is not None,
+        )
+
+        # 4. Mail from our own mailbox, caught before every other check.
+        service, result = _run_message(
+            "Thank you for reaching out.",
+            subject=AUTORESPONDER_SUBJECT,
+            sender=f"Softorino Support <{OWN_MAILBOX}>",
+            thread={"messages": []},
+        )
+        silent(service, result, "own mailbox", "self", "skipped_service")
+
+        # The self check must win even when the thread looks perfectly normal
+        # and the subject is an ordinary one.
+        service, result = _run_message(
+            "loop bait",
+            subject="Re: Crash on launch",
+            sender=OWN_MAILBOX,
+            thread={"messages": [_outgoing("bot-1", stamped=True)]},
+        )
+        expect(
+            "own mailbox is caught before the other gates",
+            result.get("skipped_reason") == "self",
+            f"result={result!r}",
+        )
+
+        # 5. Quidget agent notifications.
+        service, result = _run_message(
+            "A visitor started a chat",
+            subject="[AI Chat] New conversation from a visitor",
+            thread={"messages": []},
+        )
+        silent(service, result, "[AI Chat] notification", "service", "skipped_service")
+
+        # 6. Our own autoresponder, arriving from somewhere other than our mailbox.
+        service, result = _run_message(
+            "We have received your request.",
+            subject=f"Re: {AUTORESPONDER_SUBJECT}",
+            thread={"messages": []},
+        )
+        silent(service, result, "autoresponder subject", "service", "skipped_service")
+
+        # Subject matching is case insensitive and tolerates padding.
+        expect(
+            "service subjects match regardless of case and padding",
+            bot.is_service_subject("  [ai chat] something  ")
+            and bot.is_service_subject(AUTORESPONDER_SUBJECT.upper())
+            and not bot.is_service_subject("My app crashes"),
+        )
+
+        # 7. An unreadable thread must not be answered into.
+        class BrokenThreads(FakeGmailService):
+            def get(self, userId=None, id=None, format=None):
+                raise RuntimeError("Gmail is having a moment")
+
+        broken = BrokenThreads({"messages": []})
+        CLAUDE_CALLS.clear()
+        expect(
+            "an unreadable thread is treated as human-handled",
+            _quiet(lambda: bot.thread_has_human_reply(broken, "t1", OWN_MAILBOX)) is True,
+        )
+        expect(
+            "an unknown own address is treated as human-handled",
+            _quiet(lambda: bot.thread_has_human_reply(FakeGmailService(), "t1", "")) is True,
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
+def check_outgoing_stamp():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    try:
+        service, _result = _run_message("My app will not start", thread={"messages": []})
+        reply = service.customer_reply() or ""
+        expect(
+            "the customer reply carries the bot header",
+            f"{bot.BOT_HEADER_NAME}: {bot.BOT_HEADER_VALUE}" in reply,
+            f"headers={reply.split(chr(10) * 2)[0]!r}",
+        )
+        service, _result = _run_message(
+            "Just refund me, I don't want troubleshooting", thread={"messages": []}
+        )
+        ops = service.ops_notification() or ""
+        expect(
+            "the ops notification carries the bot header too",
+            f"{bot.BOT_HEADER_NAME}: {bot.BOT_HEADER_VALUE}" in ops,
+            f"ops={ops[:200]!r}",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
 
 
 def check_thread_grouping():
@@ -1084,6 +1297,44 @@ def check_thread_grouping():
         f"processed_count={result.get('processed_count')}",
     )
 
+    # 7. The run result has to show why things were skipped, or the logs say
+    #    nothing happened without saying why.
+    mailbox = FakeMailbox([
+        ("s1", "ts1", 1000, "[AI Chat] New conversation"),
+        ("s2", "ts2", 1000, "Your Softorino support request has been received"),
+        ("ok1", "tok", 1000, "Crash on launch"),
+    ])
+    result = _run(mailbox)
+    expect(
+        "the run counts service mail separately",
+        result.get("skipped_service_mail") == 2,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+    expect(
+        "the run still answers the real email beside them",
+        len(mailbox.created_drafts) == 1,
+        f"{len(mailbox.created_drafts)} draft(s)",
+    )
+
+    mailbox = FakeMailbox([("h1", "th", 1000, "Any update?")])
+    mailbox.thread_messages = [_outgoing("agent-1", stamped=False)]
+    result = _run(mailbox)
+    expect(
+        "the run counts human-handled threads separately",
+        result.get("skipped_human_handled") == 1 and not mailbox.created_drafts,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }, "
+        f"drafts={len(mailbox.created_drafts)}",
+    )
+
+    mailbox = FakeMailbox([("o1", "to", 1000, "Re: anything")])
+    mailbox.sender = f"Softorino Support <{OWN_MAILBOX}>"
+    result = _run(mailbox)
+    expect(
+        "the run counts our own mail separately",
+        result.get("skipped_own_mail") == 1 and not mailbox.created_drafts,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+
     return failures
 
 
@@ -1105,6 +1356,12 @@ def main():
     print("\nEnd to end (process_single_message):")
     failures += check_end_to_end()
 
+    print("\nOutgoing mail is stamped:")
+    failures += check_outgoing_stamp()
+
+    print("\nHuman agents and service mail:")
+    failures += check_human_and_service_gates()
+
     print("\nThread grouping:")
     failures += check_thread_grouping()
 
@@ -1120,6 +1377,8 @@ def main():
         + 12  # sender allow-list
         + 13  # end to end
         + 14  # thread grouping
+        + 2   # outgoing stamp
+        + 31  # human / service gates
         + 5  # quote stripping
     )
     if failures:

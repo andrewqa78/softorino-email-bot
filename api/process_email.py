@@ -48,6 +48,25 @@ EXCLUDED_SUBJECT_TERMS = [
     "receipt", "order confirmation", "auto-reply", "out of office",
 ]
 
+# Mail that exists for internal plumbing and has no customer request in it.
+# Answering one of these sent our own reasoning to a customer once ("this is an
+# automated confirmation message from Softorino's own support system..."), so
+# they are dropped before Claude is ever reached. Both lists are matched against
+# the lowercased subject and are meant to grow.
+SERVICE_SUBJECT_PREFIXES = [
+    "[ai chat]",  # Quidget chat notifications addressed to agents
+]
+SERVICE_SUBJECT_TERMS = [
+    "your softorino support request has been received",  # our own autoresponder
+]
+
+# Stamped on every message the bot sends. Its absence on an outgoing message in
+# a thread is how the bot recognises that a human agent has been answering
+# there. Mail the bot sent before this header existed has no stamp, so those
+# threads read as human-handled -- silence, which is the safe way to be wrong.
+BOT_HEADER_NAME = "X-Softorino-Bot"
+BOT_HEADER_VALUE = "1"
+
 
 def allowed_senders():
     """Parse ALLOWED_SENDERS into the sender allow-list.
@@ -306,6 +325,90 @@ def extract_escalation_marker(reply):
     clean_reply = reply[: match.start()].rstrip()
     reason = match.group(1).strip() or "Claude flagged this reply for escalation"
     return clean_reply, reason
+
+
+def _own_mailbox_address(service):
+    """Resolve the authenticated mailbox's own address.
+
+    Prefer Gmail's own profile over the GMAIL_USER_EMAIL env var: if that env
+    var ever drifts from the actual OAuth account (typo, different case, alias),
+    every From-header comparison against it silently stops matching -- and the
+    checks built on it are the ones that keep the bot from answering itself or
+    talking over an agent.
+    """
+    env_value = (os.getenv("GMAIL_USER_EMAIL") or "").strip().lower()
+    profile_email = ""
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        profile_email = (profile.get("emailAddress") or "").strip().lower()
+    except Exception as error:
+        print(f"[MAILBOX] Could not fetch Gmail profile address: {error}")
+    own_email = profile_email or env_value
+    print(
+        f"[MAILBOX] own mailbox address resolved to {own_email!r} "
+        f"(profile={profile_email!r}, env GMAIL_USER_EMAIL={env_value!r})"
+    )
+    return own_email
+
+
+def is_own_address(address, own_email):
+    """True when an address header belongs to our own mailbox."""
+    if not own_email:
+        return False
+    return own_email in (address or "").lower()
+
+
+def is_service_subject(subject):
+    """True for internal plumbing mail that carries no customer request."""
+    normalised = (subject or "").strip().lower()
+    if not normalised:
+        return False
+    if any(normalised.startswith(prefix) for prefix in SERVICE_SUBJECT_PREFIXES):
+        return True
+    return any(term in normalised for term in SERVICE_SUBJECT_TERMS)
+
+
+def thread_has_human_reply(service, thread_id, own_email):
+    """True when a person -- not this bot -- has already answered in the thread.
+
+    Groove sends an agent's reply outside the original Gmail conversation, so
+    Gmail shows several threads where Groove shows one. Thread grouping
+    therefore cannot see that an agent is already handling the ticket, which is
+    how a customer ended up with an agent's instructions and two contradicting
+    bot replies on top.
+
+    The signal used instead is the X-Softorino-Bot header: every outgoing
+    message the bot sends carries it. An outgoing message without it was written
+    by a person.
+
+    A thread that cannot be read is treated as human-handled. Staying quiet
+    costs one unanswered email; guessing wrong costs a reply written over an
+    agent in front of the customer.
+    """
+    if not thread_id:
+        return False
+    if not own_email:
+        print("[HUMAN-CHECK] Own mailbox address unknown — assuming a human is handling this.")
+        return True
+
+    try:
+        thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    except Exception as error:
+        print(f"[HUMAN-CHECK] FAILED to read thread {thread_id}: {error} — assuming human-handled.")
+        return True
+
+    for thread_message in thread.get("messages", []):
+        headers = thread_message.get("payload", {}).get("headers", [])
+        if not is_own_address(header_value(headers, "From"), own_email):
+            continue
+        msg_id = thread_message.get("id")
+        if header_value(headers, BOT_HEADER_NAME):
+            print(f"[HUMAN-CHECK] Message {msg_id}: outgoing, stamped by the bot")
+            continue
+        print(f"[HUMAN-CHECK] Message {msg_id}: outgoing WITHOUT {BOT_HEADER_NAME} — a human replied here")
+        return True
+
+    return False
 
 
 def thread_already_escalated(service, thread_id, escalated_label_id):
@@ -706,6 +809,10 @@ This ticket requires manual attention from the support team.
     escalation_msg["To"] = ", ".join(recipients)
     escalation_msg["From"] = os.getenv("GMAIL_USER_EMAIL", "support@softorino.app")
     escalation_msg["Subject"] = f"{subject_prefix}{subject} — {sender}"
+    # Stamped as well: if an ops notification ever lands in a customer thread,
+    # an unstamped outgoing message would make the bot mistake itself for an
+    # agent and go silent on that customer for good.
+    escalation_msg[BOT_HEADER_NAME] = BOT_HEADER_VALUE
     escalation_msg.set_content(escalation_body)
 
     encoded_escalation = base64.urlsafe_b64encode(escalation_msg.as_bytes()).decode()
@@ -757,6 +864,9 @@ AI_LABEL_NAMES = {
     "replied": "AI_REPLIED",
     "escalated": "AI_ESCALATED",
     "failed": "AI_FAILED",
+    # Skipped on purpose, with the reason visible in Gmail.
+    "skipped_human": "AI_SKIPPED_HUMAN",
+    "skipped_service": "AI_SKIPPED_SERVICE",
 }
 
 
@@ -901,6 +1011,7 @@ def process_unread_emails():
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     service = gmail_service()
     label_ids = ensure_labels(service)
+    own_email = _own_mailbox_address(service)
     result = (
         service.users()
         .messages()
@@ -924,6 +1035,7 @@ def process_unread_emails():
 
     results = []
     skipped_older_count = 0
+    skip_counts = {"human": 0, "service": 0, "self": 0}
     for index, (thread_id, group) in enumerate(thread_groups):
         if index > 0:
             time.sleep(DELAY_BETWEEN_EMAILS_SECONDS)
@@ -961,7 +1073,12 @@ def process_unread_emails():
         ).execute()
 
         try:
-            single_result = process_single_message(service, message, dry_run, label_ids)
+            single_result = process_single_message(
+                service, message, dry_run, label_ids, own_email=own_email
+            )
+            skip_reason = single_result.get("skipped_reason")
+            if skip_reason:
+                skip_counts[skip_reason] = skip_counts.get(skip_reason, 0) + 1
             skipped_older = _settle_older_thread_messages(
                 service, older_refs, label_ids, single_result.get("label_key")
             )
@@ -989,6 +1106,9 @@ def process_unread_emails():
     return {
         "processed_count": len(results),
         "skipped_older_in_thread": skipped_older_count,
+        "skipped_human_handled": skip_counts["human"],
+        "skipped_service_mail": skip_counts["service"],
+        "skipped_own_mail": skip_counts["self"],
         "results": results,
     }
 
@@ -1006,6 +1126,7 @@ def _deliver_customer_reply(service, message, sender, subject, reply, dry_run):
     draft_message = EmailMessage()
     draft_message["To"] = parseaddr(sender)[1] or sender
     draft_message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    draft_message[BOT_HEADER_NAME] = BOT_HEADER_VALUE
     if message_id:
         draft_message["In-Reply-To"] = message_id
         draft_message["References"] = f"{references} {message_id}".strip()
@@ -1013,10 +1134,49 @@ def _deliver_customer_reply(service, message, sender, subject, reply, dry_run):
     return deliver_reply(service, draft_message, message.get("threadId"), dry_run)
 
 
-def process_single_message(service, message, dry_run, label_ids):
+def process_single_message(service, message, dry_run, label_ids, own_email=""):
     headers = message.get("payload", {}).get("headers", [])
     sender = header_value(headers, "Reply-To") or header_value(headers, "From")
     subject = header_value(headers, "Subject") or "(no subject)"
+
+    # -- Gate 1: mail from our own mailbox. First, before anything else, so the
+    # autoresponder cannot be answered and the bot cannot talk to itself.
+    from_header = header_value(headers, "From")
+    if is_own_address(from_header, own_email):
+        print(f"[SKIP] Message {message['id']}: From is our own mailbox ({from_header!r}).")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_service")
+        return {
+            "processed": False,
+            "label_key": "skipped_service",
+            "skipped_reason": "self",
+            "subject": subject,
+            "message": "Sent by our own mailbox. Skipped, no reply.",
+        }
+
+    # -- Gate 2: internal plumbing mail with no customer request in it.
+    if is_service_subject(subject):
+        print(f"[SKIP] Message {message['id']}: service subject {subject!r}.")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_service")
+        return {
+            "processed": False,
+            "label_key": "skipped_service",
+            "skipped_reason": "service",
+            "subject": subject,
+            "message": "Service notification, not a customer request. Skipped, no reply.",
+        }
+
+    # -- Gate 3: a human agent is already answering in this thread.
+    if thread_has_human_reply(service, message.get("threadId"), own_email):
+        print(f"[SKIP] Message {message['id']}: a human agent has replied in this thread.")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_human")
+        return {
+            "processed": False,
+            "label_key": "skipped_human",
+            "skipped_reason": "human",
+            "subject": subject,
+            "message": "A human agent is handling this thread. Skipped, no reply.",
+        }
+
     # Message-ID/References are read by _deliver_customer_reply() from the same
     # headers, so they are not pulled out here any more.
     email_content = message_text(message.get("payload", {}))[:MAX_EMAIL_CHARS]

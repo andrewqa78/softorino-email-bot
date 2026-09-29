@@ -200,9 +200,43 @@ without a commit.
 **When you add or widen a trigger pattern,** add a case for it. Word boundaries
 matter: bare substrings are what caused both bugs.
 
+## Never talking over a person
+
+Three gates run before anything else, in this order. Each one labels the message
+and returns. Nothing is sent to the customer and Claude is never called.
+
+1. **Mail from our own mailbox.** `From` matching the authenticated account is
+   dropped immediately. This covers our own autoresponder and makes a reply loop
+   impossible. The address comes from the Gmail profile rather than
+   `GMAIL_USER_EMAIL`, so a typo in the env var cannot silently disable the check.
+2. **Service mail.** Subjects starting with a `SERVICE_SUBJECT_PREFIXES` entry
+   (`[AI Chat]`, Quidget's agent notifications) or containing a
+   `SERVICE_SUBJECT_TERMS` entry (our autoresponder). Both lists are meant to
+   grow.
+3. **A human agent already replied in the thread.** Every message the bot sends
+   carries `X-Softorino-Bot: 1`. An outgoing message in the thread without that
+   header was written by a person, so the bot stays out.
+
+Gate 3 exists because thread grouping cannot see this. A Groove ticket and a
+Gmail thread are not the same thing: an agent replying through Groove often
+lands outside the original conversation, so Gmail shows several threads where
+Groove shows one. Deduplication looked correct while the customer collected
+three different answers from "one" team.
+
+Two things follow from gate 3 and are intentional:
+
+- Mail the bot sent before this header existed carries no stamp, so those
+  threads now read as human-handled and the bot stays quiet in them.
+- A thread that cannot be read, or an own-address lookup that fails, counts as
+  human-handled. One unanswered email is cheaper than a reply written over an
+  agent in front of the customer.
+
+The run result reports `skipped_human_handled`, `skipped_service_mail` and
+`skipped_own_mail`.
+
 ## Gmail label-based state tracking
 
-The bot creates and manages 4 Gmail labels to track processing state per
+The bot creates and manages 6 Gmail labels to track processing state per
 message and avoid duplicate customer replies across runs (e.g. if a run
 crashes after sending a reply but before marking the email read):
 
@@ -210,6 +244,8 @@ crashes after sending a reply but before marking the email read):
 - `AI_REPLIED` — set once a reply has been successfully delivered to the customer with no escalation
 - `AI_ESCALATED` — set once the ticket has been escalated (with or without an accompanying customer reply)
 - `AI_FAILED` — set if processing raises an error; the email is left unread so the next run retries it
+- `AI_SKIPPED_HUMAN` — a human agent had already replied in the thread
+- `AI_SKIPPED_SERVICE` — service mail, or mail from our own mailbox
 
 Any message that already carries `AI_REPLIED` or `AI_ESCALATED` is skipped
 entirely on future runs, even if it somehow reappears as unread.
