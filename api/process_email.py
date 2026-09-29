@@ -72,6 +72,22 @@ SERVICE_SUBJECT_TERMS = [
 BOT_HEADER_NAME = "X-Softorino-Bot"
 BOT_HEADER_VALUE = "1"
 
+# ---------------------------------------------------------------------------
+# TEMPORARY -- diagnostic mode. Delete this block, run_mailbox_diagnostic() and
+# the branch at the top of process_unread_emails() once the question it answers
+# is settled: do Groove-sent agent replies reach this mailbox at all?
+#
+# It exists here rather than as a local script because the production refresh
+# token lives in Vercel as a Secret and cannot be read back out, so the only
+# place holding working credentials is the deployed function itself. Setting
+# DIAGNOSTIC_ADDRESSES turns a normal run into a read-only report that comes
+# back in the JSON response, which is where the GitHub Actions log already looks.
+# ---------------------------------------------------------------------------
+DIAGNOSTIC_ADDRESSES_ENV = "DIAGNOSTIC_ADDRESSES"
+DIAGNOSTIC_WINDOW_DAYS = 14
+DIAGNOSTIC_MAX_RESULTS = 50
+DIAGNOSTIC_HEADERS = ["Date", "From", "To", "Subject", "Message-ID", BOT_HEADER_NAME]
+
 
 def allowed_senders():
     """Parse ALLOWED_SENDERS into the sender allow-list.
@@ -1030,7 +1046,156 @@ def newest_ref_in_group(service, group):
     return ordered[0][1], [message_ref for _, message_ref in ordered[1:]]
 
 
+# TEMPORARY -- see the DIAGNOSTIC_ADDRESSES block above.
+def diagnostic_addresses():
+    """Addresses to report on, or [] for a normal run."""
+    raw = (os.getenv(DIAGNOSTIC_ADDRESSES_ENV) or "").strip()
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+# TEMPORARY -- see the DIAGNOSTIC_ADDRESSES block above.
+def _diagnostic_search(service, query):
+    """List a Gmail query and pull metadata for each hit. Read-only."""
+    listing = (
+        service.users()
+        .messages()
+        .list(
+            userId="me",
+            q=f"{query} newer_than:{DIAGNOSTIC_WINDOW_DAYS}d",
+            maxResults=DIAGNOSTIC_MAX_RESULTS,
+        )
+        .execute()
+    )
+    rows = []
+    for ref in listing.get("messages", []):
+        message = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=ref["id"],
+                format="metadata",
+                metadataHeaders=DIAGNOSTIC_HEADERS,
+            )
+            .execute()
+        )
+        headers = message.get("payload", {}).get("headers", [])
+        rows.append(
+            {
+                "id": message.get("id", ""),
+                "threadId": message.get("threadId", ""),
+                "date": header_value(headers, "Date"),
+                "from": header_value(headers, "From"),
+                "to": header_value(headers, "To"),
+                "subject": header_value(headers, "Subject"),
+                "message_id": header_value(headers, "Message-ID"),
+                "bot_header": header_value(headers, BOT_HEADER_NAME),
+            }
+        )
+    return rows
+
+
+# TEMPORARY -- see the DIAGNOSTIC_ADDRESSES block above.
+def run_mailbox_diagnostic(service, addresses):
+    """Report what this mailbox holds for each address. Reads only.
+
+    Never lists the unread queue, generates a reply, sends anything, applies a
+    label or clears UNREAD. The whole point is to answer one question without
+    touching a single customer conversation.
+    """
+    own_email = _own_mailbox_address(service)
+    report = {}
+    agent_replies_total = 0
+
+    for address in addresses:
+        normalised = address.lower()
+        to_rows = _diagnostic_search(service, f"to:{address}")
+        from_rows = _diagnostic_search(service, f"from:{address}")
+
+        # Outgoing = addressed to the customer but not written by them.
+        outgoing = [row for row in to_rows if normalised not in (row["from"] or "").lower()]
+        bot_sent = [row for row in outgoing if row["bot_header"]]
+        # No X-Softorino-Bot on an outgoing message means a person wrote it.
+        agent_sent = [row for row in outgoing if not row["bot_header"]]
+        agent_replies_total += len(agent_sent)
+
+        customer_threads = {row["threadId"] for row in from_rows if row["threadId"]}
+        agent_threads = {row["threadId"] for row in agent_sent if row["threadId"]}
+        shared_threads = sorted(agent_threads & customer_threads)
+        separate_threads = sorted(agent_threads - customer_threads)
+
+        if not agent_sent:
+            answer = (
+                "No agent reply reached this mailbox. A Gmail-side check cannot see "
+                "one, so the Groove API is the only source of truth."
+            )
+        elif shared_threads and not separate_threads:
+            answer = (
+                "Agent replies are here and sit in the customer's own thread. The "
+                "existing thread check should already have seen them."
+            )
+        elif shared_threads:
+            answer = (
+                "Agent replies are here, some in the customer's thread and some in "
+                "threads of their own. A search by address catches both."
+            )
+        else:
+            answer = (
+                "Agent replies are here but never in the customer's thread, which is "
+                "exactly why the thread check missed them. A search by address works."
+            )
+
+        report[address] = {
+            "messages_to": to_rows,
+            "messages_from": from_rows,
+            "verdict": {
+                "agent_replies_found": len(agent_sent),
+                "bot_replies_found": len(bot_sent),
+                "customer_messages_found": len(from_rows),
+                "customer_thread_ids": sorted(customer_threads),
+                "agent_thread_ids": sorted(agent_threads),
+                "agent_threads_shared_with_customer": shared_threads,
+                "agent_threads_separate": separate_threads,
+                "answer": answer,
+            },
+        }
+
+    if agent_replies_total:
+        overall = (
+            f"{agent_replies_total} agent reply/replies found in this mailbox. "
+            "A Gmail-side check by customer address is workable -- go with step 2."
+        )
+    else:
+        overall = (
+            "No agent replies in this mailbox at all. No Gmail-side check can work, "
+            "whatever shape it takes -- the fix has to go through the Groove API."
+        )
+
+    return {
+        "diagnostic": True,
+        "mailbox": own_email,
+        "window_days": DIAGNOSTIC_WINDOW_DAYS,
+        "addresses_checked": addresses,
+        "report": report,
+        "verdict": overall,
+        "note": "Read-only run. No mail was processed, labelled, marked read or sent.",
+    }
+
+
 def process_unread_emails():
+    # TEMPORARY -- diagnostic mode short-circuits the whole run, before the
+    # ALLOWED_SENDERS guard, so the report does not depend on how the bot's own
+    # safety switch happens to be set.
+    addresses = diagnostic_addresses()
+    if addresses:
+        print(
+            f"[DIAGNOSTIC] {DIAGNOSTIC_ADDRESSES_ENV} is set "
+            f"({len(addresses)} address(es)) — read-only report, NO mail processed."
+        )
+        return run_mailbox_diagnostic(gmail_service(), addresses)
+
     senders = allowed_senders()
     if senders is None:
         print(

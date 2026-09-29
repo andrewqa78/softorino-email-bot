@@ -244,9 +244,29 @@ Two things follow from gate 4 and are intentional:
 The run result reports `skipped_human_handled`, `skipped_service_mail`,
 `skipped_own_mail` and `skipped_stale`.
 
-`scripts/diagnose_agent_replies.py` is a read-only one-off that answers whether
-Groove-sent agent replies reach this mailbox at all. It needs the same three
-`GMAIL_*` variables the bot uses.
+### Diagnostic mode (temporary)
+
+Whether a Gmail-side check can work at all depends on one unanswered question:
+do Groove-sent agent replies reach this mailbox? Setting `DIAGNOSTIC_ADDRESSES`
+in Vercel to a comma-separated list of customer addresses turns the next run
+into a read-only report instead of a processing run.
+
+In that mode the function lists `to:<address>` and `from:<address>` over the
+last 14 days, pulls `Date`, `From`, `To`, `Subject`, `Message-ID`,
+`X-Softorino-Bot` and `threadId` for each hit, and returns the lot in the JSON
+response, where the `run-bot` workflow log already shows it. It never lists the
+unread queue, calls Claude, sends anything, applies a label or clears `UNREAD`.
+The check runs before the `ALLOWED_SENDERS` guard, so the report does not depend
+on how that switch is set.
+
+To run it: set `DIAGNOSTIC_ADDRESSES` in Vercel, Redeploy, then Actions →
+`run-bot` → Run workflow. **Clear the variable and Redeploy afterwards**, or the
+bot will keep reporting instead of answering mail.
+
+This is temporary. Delete `DIAGNOSTIC_ADDRESSES`, `run_mailbox_diagnostic()` and
+the branch at the top of `process_unread_emails()` once the question is settled.
+`scripts/diagnose_agent_replies.py` does the same thing from a terminal, for
+anyone who has the credentials to hand.
 
 ## Gmail label-based state tracking
 

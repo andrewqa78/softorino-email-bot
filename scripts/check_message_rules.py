@@ -1525,6 +1525,260 @@ def check_thread_grouping():
     return failures
 
 
+# --- diagnostic mode (TEMPORARY) --------------------------------------------
+# DIAGNOSTIC_ADDRESSES turns a deployed run into a read-only report. The whole
+# value of it rests on one promise -- that it touches nothing -- so that is what
+# these checks are mostly about.
+
+
+class FakeDiagnosticMailbox:
+    """Answers Gmail queries from a canned map and records every call made."""
+
+    def __init__(self, rows_by_query):
+        self.rows_by_query = rows_by_query
+        self.calls = []
+        self._by_id = {}
+        for rows in rows_by_query.values():
+            for row in rows:
+                self._by_id[row["id"]] = row
+
+    # -- api surface --
+    def users(self):
+        return self
+
+    def messages(self):
+        return self
+
+    def drafts(self):
+        return self
+
+    def labels(self):
+        return self
+
+    def threads(self):
+        return self
+
+    def getProfile(self, userId=None):
+        self.calls.append(("getProfile",))
+        return _Call({"emailAddress": OWN_MAILBOX})
+
+    def list(self, userId=None, q=None, maxResults=None):
+        self.calls.append(("list", q))
+        for fragment, rows in self.rows_by_query.items():
+            if fragment in (q or ""):
+                return _Call({"messages": [{"id": r["id"]} for r in rows]})
+        return _Call({"messages": []})
+
+    def get(self, userId=None, id=None, format=None, metadataHeaders=None):
+        self.calls.append(("get", id, format))
+        row = self._by_id[id]
+        headers = [
+            {"name": "Date", "value": row.get("date", "")},
+            {"name": "From", "value": row["from"]},
+            {"name": "To", "value": row.get("to", "")},
+            {"name": "Subject", "value": row.get("subject", "")},
+            {"name": "Message-ID", "value": row.get("message_id", "")},
+        ]
+        if row.get("stamped"):
+            headers.append({"name": bot.BOT_HEADER_NAME, "value": bot.BOT_HEADER_VALUE})
+        return _Call({"id": id, "threadId": row["threadId"], "payload": {"headers": headers}})
+
+    # -- anything below would be a write; none of it may be called --
+    def create(self, **kwargs):
+        raise AssertionError("diagnostic mode created a draft or a label")
+
+    def send(self, **kwargs):
+        raise AssertionError("diagnostic mode sent mail")
+
+    def modify(self, **kwargs):
+        raise AssertionError("diagnostic mode modified labels")
+
+
+@contextlib.contextmanager
+def diagnostic_env(value):
+    previous = os.environ.get("DIAGNOSTIC_ADDRESSES")
+    if value is None:
+        os.environ.pop("DIAGNOSTIC_ADDRESSES", None)
+    else:
+        os.environ["DIAGNOSTIC_ADDRESSES"] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("DIAGNOSTIC_ADDRESSES", None)
+        else:
+            os.environ["DIAGNOSTIC_ADDRESSES"] = previous
+
+
+CUSTOMER = "johnsonwjsn@gmail.com"
+
+
+def _row(msg_id, thread_id, sender, stamped=False):
+    return {
+        "id": msg_id,
+        "threadId": thread_id,
+        "from": sender,
+        "to": CUSTOMER,
+        "subject": "Re: OrderID UxGCq8ouRE",
+        "date": "Mon, 28 Sep 2026 10:00:00 +0000",
+        "message_id": f"<{msg_id}@mail>",
+        "stamped": stamped,
+    }
+
+
+def check_diagnostic_mode():
+    failures = []
+
+    def expect(label, condition, detail=""):
+        if condition:
+            print(f"  ok    {label}")
+            return
+        print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+        failures.append(label)
+
+    with diagnostic_env(None):
+        expect("unset variable means a normal run", bot.diagnostic_addresses() == [])
+    with diagnostic_env("   "):
+        expect("blank variable means a normal run", bot.diagnostic_addresses() == [])
+    with diagnostic_env(f" {CUSTOMER} , second@example.com ,, "):
+        expect(
+            "addresses are split and trimmed",
+            bot.diagnostic_addresses() == [CUSTOMER, "second@example.com"],
+            f"got {bot.diagnostic_addresses()}",
+        )
+
+    original_service = bot.gmail_service
+
+    def run_with(rows_by_query, env_value=CUSTOMER, allowed=None):
+        mailbox = FakeDiagnosticMailbox(rows_by_query)
+        bot.gmail_service = lambda: mailbox
+        CLAUDE_CALLS.clear()
+        try:
+            with diagnostic_env(env_value), allowed_senders_env(allowed):
+                return mailbox, _quiet(bot.process_unread_emails)
+        finally:
+            bot.gmail_service = original_service
+
+    # 1. An agent replied, in a thread of its own -- the production situation.
+    mailbox, result = run_with({
+        f"to:{CUSTOMER}": [
+            _row("agent-1", "thread-AGENT", "Amy <support@softorino.app>", stamped=False),
+            _row("bot-1", "thread-CUST", "Softorino <support@softorino.app>", stamped=True),
+        ],
+        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
+    })
+    verdict = result["report"][CUSTOMER]["verdict"]
+    expect("the run is flagged as a diagnostic", result.get("diagnostic") is True)
+    expect("no mail is processed", "processed_count" not in result, f"keys={sorted(result)}")
+    expect("Claude is never called", not CLAUDE_CALLS)
+    expect(
+        "the unread queue is never listed",
+        all("is:unread" not in (call[1] or "") for call in mailbox.calls if call[0] == "list"),
+        f"queries={[c[1] for c in mailbox.calls if c[0] == 'list']}",
+    )
+    expect(
+        "both queries are issued with the 14 day window",
+        sorted(c[1] for c in mailbox.calls if c[0] == "list")
+        == sorted([f"from:{CUSTOMER} newer_than:14d", f"to:{CUSTOMER} newer_than:14d"]),
+        f"queries={[c[1] for c in mailbox.calls if c[0] == 'list']}",
+    )
+    expect(
+        "metadata format is used, not full",
+        all(call[2] == "metadata" for call in mailbox.calls if call[0] == "get"),
+    )
+    expect(
+        "the agent reply is counted, the bot reply is not",
+        verdict["agent_replies_found"] == 1 and verdict["bot_replies_found"] == 1,
+        f"verdict={verdict}",
+    )
+    expect(
+        "the agent thread is reported as separate from the customer's",
+        verdict["agent_threads_separate"] == ["thread-AGENT"]
+        and verdict["agent_threads_shared_with_customer"] == [],
+        f"verdict={verdict}",
+    )
+    expect(
+        "the overall verdict points at step 2",
+        "step 2" in result["verdict"],
+        f"verdict={result['verdict']!r}",
+    )
+    expect(
+        "the raw messages are returned for both directions",
+        len(result["report"][CUSTOMER]["messages_to"]) == 2
+        and len(result["report"][CUSTOMER]["messages_from"]) == 1,
+    )
+
+    # 2. Only bot replies: the answer has to point at the Groove API.
+    mailbox, result = run_with({
+        f"to:{CUSTOMER}": [_row("bot-1", "thread-CUST", "Softorino <support@softorino.app>", stamped=True)],
+        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
+    })
+    verdict = result["report"][CUSTOMER]["verdict"]
+    expect(
+        "a mailbox with no agent replies says so",
+        verdict["agent_replies_found"] == 0,
+        f"verdict={verdict}",
+    )
+    expect(
+        "the overall verdict points at the Groove API",
+        "Groove API" in result["verdict"],
+        f"verdict={result['verdict']!r}",
+    )
+
+    # 3. An agent replying inside the customer's own thread.
+    mailbox, result = run_with({
+        f"to:{CUSTOMER}": [_row("agent-1", "thread-CUST", "Amy <support@softorino.app>")],
+        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
+    })
+    verdict = result["report"][CUSTOMER]["verdict"]
+    expect(
+        "an agent reply in the customer's thread is reported as shared",
+        verdict["agent_threads_shared_with_customer"] == ["thread-CUST"]
+        and verdict["agent_threads_separate"] == [],
+        f"verdict={verdict}",
+    )
+
+    # 4. A message the customer sent is never mistaken for an agent reply.
+    mailbox, result = run_with({
+        f"to:{CUSTOMER}": [_row("cust-echo", "thread-CUST", f"Willie <{CUSTOMER}>")],
+        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
+    })
+    expect(
+        "the customer's own mail is not counted as an agent reply",
+        result["report"][CUSTOMER]["verdict"]["agent_replies_found"] == 0,
+        f"verdict={result['report'][CUSTOMER]['verdict']}",
+    )
+
+    # 5. It must run even with ALLOWED_SENDERS unset -- the safety switch that
+    #    normally stops everything must not stop the report.
+    mailbox, result = run_with(
+        {f"to:{CUSTOMER}": [], f"from:{CUSTOMER}": []}, allowed=None
+    )
+    expect(
+        "the report runs even with ALLOWED_SENDERS unset",
+        result.get("diagnostic") is True,
+        f"result keys={sorted(result)}",
+    )
+
+    # 6. Several addresses in one go.
+    mailbox, result = run_with(
+        {
+            f"to:{CUSTOMER}": [_row("agent-1", "thread-A", "Amy <support@softorino.app>")],
+            "to:bisaillonfamily@gmail.com": [],
+            f"from:{CUSTOMER}": [],
+            "from:bisaillonfamily@gmail.com": [],
+        },
+        env_value=f"{CUSTOMER},bisaillonfamily@gmail.com",
+    )
+    expect(
+        "every address gets its own section",
+        sorted(result["report"]) == sorted([CUSTOMER, "bisaillonfamily@gmail.com"]),
+        f"report keys={sorted(result['report'])}",
+    )
+
+    return failures
+
+
 def main():
     print("Escalation triggers:")
     failures = check_escalations()
@@ -1549,6 +1803,9 @@ def main():
     print("\nHuman agents and service mail:")
     failures += check_human_and_service_gates()
 
+    print("\nDiagnostic mode (temporary):")
+    failures += check_diagnostic_mode()
+
     print("\nMessage age:")
     failures += check_message_age()
 
@@ -1570,6 +1827,7 @@ def main():
         + 2   # outgoing stamp
         + 31  # human / service gates
         + 21  # message age
+        + 18  # diagnostic mode
         + 5  # quote stripping
     )
     if failures:

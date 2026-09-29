@@ -40,7 +40,9 @@ jobs:
           status=$?
           set -e
 
-          echo "$response"
+          # Pretty-print when it is JSON, which the diagnostic response very
+          # much is; fall back to raw so an error page still shows up.
+          echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
 
           if [ $status -ne 0 ]; then
             echo "::error::Bot request failed (curl exit $status)"
