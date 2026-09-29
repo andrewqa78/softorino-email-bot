@@ -40,7 +40,12 @@ MAX_EMAILS_PER_RUN = 10
 # into one thread, so listing only MAX_EMAILS_PER_RUN would let one talkative
 # customer starve everyone else out of the run.
 MAX_MESSAGES_SCANNED_PER_RUN = MAX_EMAILS_PER_RUN * 5
-PROCESS_WINDOW_DAYS = 7
+# Gmail's newer_than: takes d/m/y only -- there is no hour unit -- so the window
+# is the age limit rounded UP to whole days. Rounding up on purpose: the query
+# window must never be narrower than the age gate, or the query would be doing
+# the cutting and MAX_MESSAGE_AGE_HOURS would quietly stop meaning anything.
+def process_window_days():
+    return max(1, -(-MAX_MESSAGE_AGE_HOURS // 24))
 # Groove does not clear the UNREAD flag in Gmail, so unread mail piles up and
 # the queue is mostly old tickets that agents closed days ago. Answering one of
 # those is how the bot replied over agent Amy on a case she had already
@@ -122,7 +127,7 @@ def allowed_senders():
 def build_unread_query(senders):
     terms = [
         "in:inbox", "is:unread", "-in:spam", "-in:trash",
-        f"newer_than:{PROCESS_WINDOW_DAYS}d",
+        f"newer_than:{process_window_days()}d",
     ]
     if senders:
         # Gmail groups alternatives with parentheses: from:(a@x.com OR b@y.com).
@@ -1617,7 +1622,18 @@ def process_single_message(
             f"[SKIP] Message {message['id']}: {age_text} old "
             f"(limit {MAX_MESSAGE_AGE_HOURS}h) — an agent has almost certainly handled it."
         )
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_stale", dry_run=dry_run)
+        # UNREAD is deliberately left alone. The date-bounded query already keeps
+        # these out of the next run, and with ~80k unread messages in this
+        # mailbox the flag plainly is not ours to manage -- Groove collects the
+        # mail and nothing marks it read. The label stays, for auditing.
+        _finalize_message_labels(
+            service,
+            message["id"],
+            label_ids,
+            "skipped_stale",
+            remove_unread=False,
+            dry_run=dry_run,
+        )
         return {
             "processed": False,
             "label_key": "skipped_stale",

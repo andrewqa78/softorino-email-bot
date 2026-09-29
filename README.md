@@ -57,7 +57,7 @@ endpoints with GET, manual/curl testing typically uses POST — both run
 the same processing and return the same JSON response) and processes
 up to 10 unread **threads** per run (1 second delay between each):
 
-1. **Filter at fetch time** — Gmail query only returns mail from the last 7 days, and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
+1. **Filter at fetch time** — the Gmail query is bounded by `newer_than:`, derived from `MAX_MESSAGE_AGE_HOURS` (see below), and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
 2. **Filter auto-replies and bounces** — Skips emails from `mailer-daemon@`, `noreply@` or with subjects like "Out of Office" or "Delivery Failed"
 3. **Detect sensitive content** — Threats, legal language or severe insults escalate to the ops team and the customer gets a fixed template (`SENSITIVE_ESCALATION_REPLY`), never a generated reply
 4. **Check escalation triggers** — Refunds, charges, cancellations, fraud or payment providers escalate to the ops team, and the customer still gets a reply generated from the escalation template for the matching category
@@ -219,12 +219,10 @@ and returns. Nothing is sent to the customer and Claude is never called.
    what happened on a live run. Subjects that merely start with those letters
    (`Refund`, `Reply needed:`, `Regarding:`, `Forward my licence`) are left
    alone.
-3. **The message is older than `MAX_MESSAGE_AGE_HOURS` (12).** Groove never
-   clears `UNREAD` in Gmail, so unread mail piles up and the queue fills with
-   tickets agents closed days ago. Anything that has sat for half a day is
-   assumed handled. The check reads `internalDate` locally, so it runs before
-   the gate below, which costs an API call. A missing or unparseable
-   `internalDate` counts as stale.
+3. **The message is older than `MAX_MESSAGE_AGE_HOURS` (12).** The check reads
+   `internalDate` locally, so it runs before the gate below, which costs an API
+   call. A missing or unparseable `internalDate` counts as stale. This is a
+   backstop, not the main filter -- see below.
 4. **A human agent already replied in the thread.** Every message the bot sends
    carries `X-Softorino-Bot: 1`. An outgoing message in the thread without that
    header, and without a service subject, was written by a person.
@@ -235,8 +233,24 @@ and returns. Nothing is sent to the customer and Claude is never called.
    failed lookup skips the message and is reported as `human_check_failed`, kept
    apart from real hits so a broken query cannot pass for the gate working.
 
-Stale mail is labelled *and* marked read. Left unread it would be re-listed on
-every run and crowd fresh mail out of `MAX_MESSAGES_SCANNED_PER_RUN`.
+### The unread flag means nothing here
+
+`UNREAD` is not a queue in this mailbox. Groove collects the mail and nothing
+marks it read, so the count sits around 80,000 and only grows. Building the work
+queue on that flag alone meant the bot was always looking at whatever Gmail
+happened to return first.
+
+The queue is bounded by date instead. `build_unread_query()` adds
+`newer_than:<n>d`, where `n` comes from `MAX_MESSAGE_AGE_HOURS` rounded **up** to
+whole days -- Gmail's `newer_than:` has no hour unit. Rounding up keeps the query
+window from ever being narrower than the age gate, so the gate stays the precise
+cut and the query never silently does the cutting instead. Both come from one
+constant, so they cannot drift apart.
+
+Stale mail is labelled but keeps its `UNREAD` flag. The date-bounded query
+already keeps it out of the next run, and with 80,000 unread messages the flag
+is plainly not the bot's to manage. Every other gate does clear it: those
+messages are inside the date window and would otherwise be re-listed every run.
 
 ### What counts as an agent
 

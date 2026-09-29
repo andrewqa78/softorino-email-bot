@@ -1575,9 +1575,9 @@ def check_dry_run():
         mailbox.store["o1"]["internalDate"] = _epoch_ms_hours_ago(30)
         _run(mailbox, dry_run=True)
         expect(
-            "a stale skip still labels in DRY_RUN",
+            "a stale skip still labels in DRY_RUN, and keeps UNREAD",
             "id-AI_SKIPPED_STALE" in mailbox.labels_of("o1")
-            and "UNREAD" not in mailbox.labels_of("o1"),
+            and "UNREAD" in mailbox.labels_of("o1"),
             f"labels={mailbox.labels_of('o1')}",
         )
 
@@ -2029,11 +2029,51 @@ def check_message_age():
             f"result={ {k: v for k, v in result.items() if k != 'results'} }",
         )
         expect(
-            "a stale message loses UNREAD and gains AI_SKIPPED_STALE",
-            "UNREAD" not in mailbox.labels_of("old1")
-            and "id-AI_SKIPPED_STALE" in mailbox.labels_of("old1"),
+            "a stale message gains AI_SKIPPED_STALE",
+            "id-AI_SKIPPED_STALE" in mailbox.labels_of("old1"),
             f"labels={mailbox.labels_of('old1')}",
         )
+        expect(
+            "a stale message keeps UNREAD -- the date-bounded query drops it anyway",
+            "UNREAD" in mailbox.labels_of("old1"),
+            f"labels={mailbox.labels_of('old1')}",
+        )
+        # The other gates still settle the message, so it is not re-listed.
+        service_mailbox = FakeMailbox([("s1", "ts", 1000, "[AI Chat] New conversation")])
+        _run(service_mailbox, dry_run=False)
+        expect(
+            "a service skip still clears UNREAD",
+            "UNREAD" not in service_mailbox.labels_of("s1"),
+            f"labels={service_mailbox.labels_of('s1')}",
+        )
+
+        # -- the queue itself is bounded by date, so the age gate is a backstop --
+        query = bot.build_unread_query([])
+        expect(
+            "the queue query is bounded by date",
+            f"newer_than:{bot.process_window_days()}d" in query,
+            f"query={query!r}",
+        )
+        expect(
+            "exactly one newer_than term, so two windows cannot disagree",
+            query.count("newer_than:") == 1,
+            f"query={query!r}",
+        )
+        original_limit = bot.MAX_MESSAGE_AGE_HOURS
+        try:
+            for hours, expected_days in [(1, 1), (12, 1), (24, 1), (25, 2), (48, 2), (72, 3)]:
+                bot.MAX_MESSAGE_AGE_HOURS = hours
+                expect(
+                    f"{hours}h maps to newer_than:{expected_days}d",
+                    bot.process_window_days() == expected_days,
+                    f"got {bot.process_window_days()}",
+                )
+                expect(
+                    f"the {hours}h window is never narrower than the age gate",
+                    bot.process_window_days() * 24 >= hours,
+                )
+        finally:
+            bot.MAX_MESSAGE_AGE_HOURS = original_limit
         expect("a stale message is not replied to", not mailbox.created_drafts)
 
         mailbox = FakeMailbox([
@@ -2533,7 +2573,7 @@ def main():
         + 15  # thread grouping
         + 2   # outgoing stamp
         + 33  # human / service gates
-        + 21  # message age
+        + 35  # message age
         + 18  # diagnostic mode
         + 23  # agent lookup
         + 19  # dry run
