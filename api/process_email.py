@@ -655,7 +655,13 @@ def relevant_kb_files(email_content):
                                "subscription", "subscribe", "unsubscribe",
                                "renew", "renewal", "cancel"),
         "activation_and_license.md": ("activation", "license", "subscription", "dashboard"),
-        "Softorino_Billing_and_Payments.md": ("refund", "charge", "billing", "payment", "cancel"),
+        # Same trap as the Stripe list: bare "charge" matches "my phone doesn't
+        # charge when connected". Phrases work here -- the matcher word-boundary
+        # searches the whole key, so "charge me" and "charge my" catch the real
+        # billing wordings without the cable tickets.
+        "Softorino_Billing_and_Payments.md": ("refund", "charged", "billed",
+                                              "charge me", "charge my",
+                                              "billing", "payment", "cancel"),
         "other_products.md": (
             "folder colorizer", "picfindr", "cleanappsnow",
             "volume concierge", "memory optimizer", "task forcequit",
