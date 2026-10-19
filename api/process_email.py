@@ -648,19 +648,24 @@ def relevant_kb_files(email_content):
         # too -- a Stripe order has no FastSpring record and the agent would
         # otherwise report "order not found". Deliberately broad: over-loading
         # 9KB is cheaper than answering a billing ticket without it.
-        # "charged"/"billed" rather than bare "charge" -- customers write
-        # "my phone doesn't charge when connected", which is a cable ticket.
+        # Every "charge" key is narrowed, because this is a device app and the
+        # word means batteries here as often as money:
+        #   "charged"/"billed", not "charge"    -- "my phone doesn't charge"
+        #   "charge my card", not "charge my"   -- "I can't charge my iPhone"
         "stripe_payments.md": ("stripe", "refund", "refunded", "billing", "billed",
-                               "payment", "charged", "invoice", "receipt",
+                               "payment", "charged", "charge me", "charge my card",
+                               "invoice", "receipt",
                                "subscription", "subscribe", "unsubscribe",
                                "renew", "renewal", "cancel"),
         "activation_and_license.md": ("activation", "license", "subscription", "dashboard"),
-        # Same trap as the Stripe list: bare "charge" matches "my phone doesn't
-        # charge when connected". Phrases work here -- the matcher word-boundary
-        # searches the whole key, so "charge me" and "charge my" catch the real
-        # billing wordings without the cable tickets.
+        # Same narrowing as the Stripe list above. Phrases work here -- the
+        # matcher word-boundary searches the whole key, the way "softorino
+        # convert" already does -- so the money wordings are matched without
+        # the hardware ones:
+        #   "charged"/"billed", not "charge"    -- "the battery won't charge"
+        #   "charge my card", not "charge my"   -- "I can't charge my iPhone"
         "Softorino_Billing_and_Payments.md": ("refund", "charged", "billed",
-                                              "charge me", "charge my",
+                                              "charge me", "charge my card",
                                               "billing", "payment", "cancel"),
         "other_products.md": (
             "folder colorizer", "picfindr", "cleanappsnow",
