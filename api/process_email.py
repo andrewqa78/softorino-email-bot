@@ -644,6 +644,16 @@ def relevant_kb_files(email_content):
         "iringg.md": ("iringg",),
         "beamer.md": ("beamer",),
         "softorino_convert.md": ("softorino convert",),
+        # Stripe runs alongside FastSpring, so any money ticket needs this file
+        # too -- a Stripe order has no FastSpring record and the agent would
+        # otherwise report "order not found". Deliberately broad: over-loading
+        # 9KB is cheaper than answering a billing ticket without it.
+        # "charged"/"billed" rather than bare "charge" -- customers write
+        # "my phone doesn't charge when connected", which is a cable ticket.
+        "stripe_payments.md": ("stripe", "refund", "refunded", "billing", "billed",
+                               "payment", "charged", "invoice", "receipt",
+                               "subscription", "subscribe", "unsubscribe",
+                               "renew", "renewal", "cancel"),
         "activation_and_license.md": ("activation", "license", "subscription", "dashboard"),
         "Softorino_Billing_and_Payments.md": ("refund", "charge", "billing", "payment", "cancel"),
         "other_products.md": (
