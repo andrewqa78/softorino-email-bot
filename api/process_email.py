@@ -35,11 +35,11 @@ ALLOWED_SENDERS_ALL = "all"
 # One run handles at most this many THREADS. ~70 mails a day arrive in working
 # hours rather than evenly, so 5 was short at peak. Each thread takes 15-20s and
 # the platform kills the function at 300s, so 10 is about as high as this goes.
-MAX_EMAILS_PER_RUN = 10
+MAX_THREADS_PER_RUN = 10
 # How many unread messages to list before grouping. Several messages can collapse
-# into one thread, so listing only MAX_EMAILS_PER_RUN would let one talkative
+# into one thread, so listing only MAX_THREADS_PER_RUN would let one talkative
 # customer starve everyone else out of the run.
-MAX_MESSAGES_SCANNED_PER_RUN = MAX_EMAILS_PER_RUN * 5
+MAX_MESSAGES_SCANNED_PER_RUN = MAX_THREADS_PER_RUN * 5
 # Gmail's newer_than: takes d/m/y only -- there is no hour unit -- so the window
 # is the age limit rounded UP to whole days. Rounding up on purpose: the query
 # window must never be narrower than the age gate, or the query would be doing
@@ -70,6 +70,23 @@ SERVICE_SUBJECT_TERMS = [
     "your softorino support request has been received",  # our own autoresponder
 ]
 
+# Subject prefix of the ops notification escalate_email() sends, by priority.
+# These go out from our own mailbox to the ESCALATION_EMAIL addresses, so
+# without recognising them is_agent_message() read every notification as an
+# agent writing to that address, and the address was silenced for good.
+# Deliberately not in SERVICE_SUBJECT_PREFIXES: a customer can write
+# "[HIGH PRIORITY] app broken" and gate 2 must not drop that.
+OPS_NOTIFICATION_PREFIXES = {
+    "NORMAL": "[ESCALATION]",
+    "HIGH PRIORITY": "[HIGH PRIORITY]",
+    "SENSITIVE": "[SENSITIVE]",
+}
+
+# Mailing lists and marketing mail carry List-Unsubscribe (RFC 2369); a
+# customer writing to support does not. Fresh spam would otherwise cost a
+# Claude call and get a reply.
+BULK_MAIL_HEADER = "List-Unsubscribe"
+
 # Stamped on every message the bot sends. Its absence on an outgoing message in
 # a thread is how the bot recognises that a human agent has been answering
 # there. Mail the bot sent before this header existed has no stamp, so those
@@ -82,22 +99,6 @@ BOT_HEADER_VALUE = "1"
 # customer's address up directly sidesteps threading altogether.
 AGENT_SEARCH_WINDOW_DAYS = 14
 AGENT_SEARCH_MAX_RESULTS = 20
-
-# ---------------------------------------------------------------------------
-# TEMPORARY -- diagnostic mode. Delete this block, run_mailbox_diagnostic() and
-# the branch at the top of process_unread_emails() once the question it answers
-# is settled: do Groove-sent agent replies reach this mailbox at all?
-#
-# It exists here rather than as a local script because the production refresh
-# token lives in Vercel as a Secret and cannot be read back out, so the only
-# place holding working credentials is the deployed function itself. Setting
-# DIAGNOSTIC_ADDRESSES turns a normal run into a read-only report that comes
-# back in the JSON response, which is where the GitHub Actions log already looks.
-# ---------------------------------------------------------------------------
-DIAGNOSTIC_ADDRESSES_ENV = "DIAGNOSTIC_ADDRESSES"
-DIAGNOSTIC_WINDOW_DAYS = 14
-DIAGNOSTIC_MAX_RESULTS = 50
-DIAGNOSTIC_HEADERS = ["Date", "From", "To", "Subject", "Message-ID", BOT_HEADER_NAME]
 
 
 def allowed_senders():
@@ -464,17 +465,34 @@ def is_agent_message(headers):
     request has been received") does not -- and it goes to every customer, so
     treating "unstamped" as "agent" on its own would mark every single ticket
     as human-handled and the bot would stop answering anyone at all. Three of
-    the six agent replies the mailbox diagnostic found were this autoresponder.
+    the six agent replies found in the mailbox were this autoresponder.
 
     Callers must already know the message is outgoing; this only rules out the
-    two automated senders. The subject lists it reuses are the same ones the
-    service-mail gate matches on.
+    automated senders. The subject lists it reuses are the same ones the
+    service-mail gate matches on, plus the ops notification prefixes, which a
+    "Re:" in front does not hide.
     """
     if header_value(headers, BOT_HEADER_NAME):
         return False
-    if is_service_subject(header_value(headers, "Subject")):
+    subject = header_value(headers, "Subject")
+    if is_service_subject(subject):
+        return False
+    if is_ops_notification_subject(subject):
         return False
     return True
+
+
+def is_ops_notification_subject(subject):
+    """True for the subject of a notification escalate_email() sent to ops."""
+    normalised = strip_reply_prefixes(subject).lower()
+    return any(
+        normalised.startswith(prefix.lower()) for prefix in OPS_NOTIFICATION_PREFIXES.values()
+    )
+
+
+def is_bulk_mail(headers):
+    """True for mailing-list and marketing mail."""
+    return bool(header_value(headers, BULK_MAIL_HEADER))
 
 
 def thread_has_human_reply(service, thread_id, own_email):
@@ -631,8 +649,10 @@ def fetch_kb_file(filename):
         return response.read().decode("utf-8")
 
 
-def relevant_kb_files(email_content):
-    content = email_content.lower()
+def relevant_kb_files(email_content, subject=""):
+    # The subject counts too: "Problems with Beamer" over a body that never
+    # names the product used to get no Beamer knowledge at all.
+    content = f"{strip_reply_prefixes(subject)}\n{email_content}".lower()
     # Loaded for every email: tone_of_voice.md defines the reply format, so it
     # must never be routed away by keyword matching.
     base_files = ["active_product_issues.md", "global_rules.md", "tone_of_voice.md"]
@@ -680,8 +700,8 @@ def relevant_kb_files(email_content):
     return files
 
 
-def build_knowledge_base(email_content):
-    files = relevant_kb_files(email_content)
+def build_knowledge_base(email_content, subject=""):
+    files = relevant_kb_files(email_content, subject)
     sections = []
     for filename in files:
         sections.append(f"\n--- {filename} ---\n{fetch_kb_file(filename)}")
@@ -966,13 +986,22 @@ def escalate_email(service, sender, subject, email_content, reason, priority="NO
         if email
     ]
     if not recipients:
+        # Not silent: the run result counts these in ops_notifications_skipped
+        # and lists every message affected.
         print(
             f"[ESCALATION] SKIPPED — no ESCALATION_EMAIL_1/ESCALATION_EMAIL_2 configured. "
             f"reason={reason!r} priority={priority}"
         )
-        return {"escalated": False, "recipients": [], "reason": reason, "priority": priority}
+        return {
+            "escalated": False,
+            "skipped_no_recipients": True,
+            "recipients": [],
+            "reason": reason,
+            "priority": priority,
+            "customer": sender,
+        }
 
-    subject_prefix = f"[{priority}] " if priority != "NORMAL" else "[ESCALATION] "
+    subject_prefix = OPS_NOTIFICATION_PREFIXES.get(priority, f"[{priority}]") + " "
 
     # Dry runs are idempotent by design: the same messages are reprocessed on
     # every run, so a real notification here would reach the team once per press
@@ -1079,6 +1108,9 @@ AI_LABEL_NAMES = {
     "skipped_human": "AI_SKIPPED_HUMAN",
     "skipped_service": "AI_SKIPPED_SERVICE",
     "skipped_stale": "AI_SKIPPED_STALE",
+    # The agent lookup failed. UNREAD stays on so the next run retries; if the
+    # failure persists, the age gate settles the message after 12 hours.
+    "check_failed": "AI_CHECK_FAILED",
 }
 
 
@@ -1136,6 +1168,10 @@ def _finalize_message_labels(
     remove_ids = [label_ids["processing"]]
     if remove_unread:
         remove_ids.append("UNREAD")
+    # A retry that gets further than the failed lookup drops the old marker, so
+    # the message does not read as both failed and handled.
+    if add_label_key != "check_failed" and label_ids.get("check_failed"):
+        remove_ids.append(label_ids["check_failed"])
     add_ids = [label_ids[add_label_key]] if add_label_key else []
     service.users().messages().modify(
         userId="me",
@@ -1224,149 +1260,6 @@ def newest_ref_in_group(service, group):
     return ordered[0][1], [message_ref for _, message_ref in ordered[1:]]
 
 
-# TEMPORARY -- see the DIAGNOSTIC_ADDRESSES block above.
-def diagnostic_addresses():
-    """Addresses to report on, or [] for a normal run."""
-    raw = (os.getenv(DIAGNOSTIC_ADDRESSES_ENV) or "").strip()
-    if not raw:
-        return []
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
-# TEMPORARY -- see the DIAGNOSTIC_ADDRESSES block above.
-def _diagnostic_search(service, query):
-    """List a Gmail query and pull metadata for each hit. Read-only."""
-    listing = (
-        service.users()
-        .messages()
-        .list(
-            userId="me",
-            q=f"{query} newer_than:{DIAGNOSTIC_WINDOW_DAYS}d",
-            maxResults=DIAGNOSTIC_MAX_RESULTS,
-        )
-        .execute()
-    )
-    rows = []
-    for ref in listing.get("messages", []):
-        message = (
-            service.users()
-            .messages()
-            .get(
-                userId="me",
-                id=ref["id"],
-                format="metadata",
-                metadataHeaders=DIAGNOSTIC_HEADERS,
-            )
-            .execute()
-        )
-        headers = message.get("payload", {}).get("headers", [])
-        rows.append(
-            {
-                "id": message.get("id", ""),
-                "threadId": message.get("threadId", ""),
-                "date": header_value(headers, "Date"),
-                "from": header_value(headers, "From"),
-                "to": header_value(headers, "To"),
-                "subject": header_value(headers, "Subject"),
-                "message_id": header_value(headers, "Message-ID"),
-                "bot_header": header_value(headers, BOT_HEADER_NAME),
-            }
-        )
-    return rows
-
-
-# TEMPORARY -- see the DIAGNOSTIC_ADDRESSES block above.
-def run_mailbox_diagnostic(service, addresses):
-    """Report what this mailbox holds for each address. Reads only.
-
-    Never lists the unread queue, generates a reply, sends anything, applies a
-    label or clears UNREAD. The whole point is to answer one question without
-    touching a single customer conversation.
-    """
-    own_email = _own_mailbox_address(service)
-    report = {}
-    agent_replies_total = 0
-
-    for address in addresses:
-        normalised = address.lower()
-        to_rows = _diagnostic_search(service, f"to:{address}")
-        from_rows = _diagnostic_search(service, f"from:{address}")
-
-        # Outgoing = addressed to the customer but not written by them.
-        outgoing = [row for row in to_rows if normalised not in (row["from"] or "").lower()]
-        bot_sent = [row for row in outgoing if row["bot_header"]]
-        # Unstamped is not enough on its own: the autoresponder goes out to
-        # every customer without the header either. Same subject lists the
-        # service-mail gate uses.
-        unstamped = [row for row in outgoing if not row["bot_header"]]
-        auto_sent = [row for row in unstamped if is_service_subject(row["subject"])]
-        agent_sent = [row for row in unstamped if not is_service_subject(row["subject"])]
-        agent_replies_total += len(agent_sent)
-
-        customer_threads = {row["threadId"] for row in from_rows if row["threadId"]}
-        agent_threads = {row["threadId"] for row in agent_sent if row["threadId"]}
-        shared_threads = sorted(agent_threads & customer_threads)
-        separate_threads = sorted(agent_threads - customer_threads)
-
-        if not agent_sent:
-            answer = (
-                "No agent reply reached this mailbox. A Gmail-side check cannot see "
-                "one, so the Groove API is the only source of truth."
-            )
-        elif shared_threads and not separate_threads:
-            answer = (
-                "Agent replies are here and sit in the customer's own thread. The "
-                "existing thread check should already have seen them."
-            )
-        elif shared_threads:
-            answer = (
-                "Agent replies are here, some in the customer's thread and some in "
-                "threads of their own. A search by address catches both."
-            )
-        else:
-            answer = (
-                "Agent replies are here but never in the customer's thread, which is "
-                "exactly why the thread check missed them. A search by address works."
-            )
-
-        report[address] = {
-            "messages_to": to_rows,
-            "messages_from": from_rows,
-            "verdict": {
-                "agent_replies_found": len(agent_sent),
-                "bot_replies_found": len(bot_sent),
-                "autoresponder_found": len(auto_sent),
-                "customer_messages_found": len(from_rows),
-                "customer_thread_ids": sorted(customer_threads),
-                "agent_thread_ids": sorted(agent_threads),
-                "agent_threads_shared_with_customer": shared_threads,
-                "agent_threads_separate": separate_threads,
-                "answer": answer,
-            },
-        }
-
-    if agent_replies_total:
-        overall = (
-            f"{agent_replies_total} agent reply/replies found in this mailbox. "
-            "A Gmail-side check by customer address is workable -- go with step 2."
-        )
-    else:
-        overall = (
-            "No agent replies in this mailbox at all. No Gmail-side check can work, "
-            "whatever shape it takes -- the fix has to go through the Groove API."
-        )
-
-    return {
-        "diagnostic": True,
-        "mailbox": own_email,
-        "window_days": DIAGNOSTIC_WINDOW_DAYS,
-        "addresses_checked": addresses,
-        "report": report,
-        "verdict": overall,
-        "note": "Read-only run. No mail was processed, labelled, marked read or sent.",
-    }
-
-
 def unread_message_count(service):
     """How many unread messages the mailbox holds in total.
 
@@ -1383,17 +1276,6 @@ def unread_message_count(service):
 
 
 def process_unread_emails():
-    # TEMPORARY -- diagnostic mode short-circuits the whole run, before the
-    # ALLOWED_SENDERS guard, so the report does not depend on how the bot's own
-    # safety switch happens to be set.
-    addresses = diagnostic_addresses()
-    if addresses:
-        print(
-            f"[DIAGNOSTIC] {DIAGNOSTIC_ADDRESSES_ENV} is set "
-            f"({len(addresses)} address(es)) — read-only report, NO mail processed."
-        )
-        return run_mailbox_diagnostic(gmail_service(), addresses)
-
     senders = allowed_senders()
     if senders is None:
         print(
@@ -1437,13 +1319,15 @@ def process_unread_emails():
     thread_groups = group_refs_by_thread(message_refs)
     print(
         f"[THREADS] {len(message_refs)} unread message(s) in {len(thread_groups)} thread(s); "
-        f"handling at most {MAX_EMAILS_PER_RUN}"
+        f"handling at most {MAX_THREADS_PER_RUN}"
     )
-    thread_groups = thread_groups[:MAX_EMAILS_PER_RUN]
+    thread_groups = thread_groups[:MAX_THREADS_PER_RUN]
 
     results = []
     skipped_older_count = 0
-    skip_counts = {"human": 0, "service": 0, "self": 0, "stale": 0, "human_check_failed": 0}
+    skip_counts = {
+        "human": 0, "service": 0, "bulk": 0, "self": 0, "stale": 0, "human_check_failed": 0,
+    }
     # One lookup per customer per run: two messages from the same person must
     # not cost the same 21 API calls twice.
     agent_search_cache = {}
@@ -1453,6 +1337,10 @@ def process_unread_emails():
     # In DRY_RUN the ops notification is not sent; what it would have said is
     # recorded here instead.
     suppressed_ops_notifications = []
+    # Escalations whose ops notification never left: no ESCALATION_EMAIL
+    # configured, or the send failed. The team never hears of these, so they
+    # have to be loud here.
+    ops_notifications_skipped = []
     for index, (thread_id, group) in enumerate(thread_groups):
         if index > 0:
             time.sleep(DELAY_BETWEEN_EMAILS_SECONDS)
@@ -1515,6 +1403,21 @@ def process_unread_emails():
                         "would_notify": escalation_info.get("would_notify", []),
                     }
                 )
+            if escalation_info.get("skipped_no_recipients") or escalation_info.get("error"):
+                ops_notifications_skipped.append(
+                    {
+                        "message_id": message["id"],
+                        "subject": single_result.get("subject", ""),
+                        "customer": escalation_info.get("customer", ""),
+                        "reason": escalation_info.get("reason", ""),
+                        "priority": escalation_info.get("priority", ""),
+                        "why": (
+                            "no_recipients"
+                            if escalation_info.get("skipped_no_recipients")
+                            else f"send_failed: {escalation_info['error']}"
+                        ),
+                    }
+                )
             if skip_reason in ("human", "human_check_failed"):
                 human_gate_hits.append(
                     {
@@ -1557,11 +1460,14 @@ def process_unread_emails():
         "skipped_older_in_thread": skipped_older_count,
         "skipped_human_handled": skip_counts["human"],
         "skipped_service_mail": skip_counts["service"],
+        "skipped_bulk": skip_counts["bulk"],
         "skipped_own_mail": skip_counts["self"],
         "skipped_stale": skip_counts["stale"],
         "human_check_failed": skip_counts["human_check_failed"],
         "human_gate_hits": human_gate_hits,
         "suppressed_ops_notifications": suppressed_ops_notifications,
+        "ops_notifications_skipped": len(ops_notifications_skipped),
+        "ops_notifications_skipped_messages": ops_notifications_skipped,
         "results": results,
     }
 
@@ -1599,6 +1505,159 @@ def _with_dry_run_reply(result, reply, dry_run):
     return result
 
 
+def _reply_blocker(service, message, sender, own_email, agent_search_cache):
+    """Why the customer must not be answered right now, or None.
+
+    Gates 4-6: the message is too old, a person is in the thread, or a person
+    has written to this customer recently. Shared by the normal path, which
+    skips the message, and the sensitive path, which still pages ops but holds
+    back the fixed reply.
+
+    Returns the skip result for the caller to send back, plus "remove_unread",
+    which the caller pops and hands to _finalize_message_labels().
+    """
+    # -- Gate 4: the message has been sitting too long to still be current.
+    # Local check, no API call, so it runs before the two lookups below.
+    if is_stale_message(message):
+        age = message_age_hours(message)
+        age_text = f"{age:.1f}h" if age is not None else "unknown age"
+        print(
+            f"[SKIP] Message {message['id']}: {age_text} old "
+            f"(limit {MAX_MESSAGE_AGE_HOURS}h) — an agent has almost certainly handled it."
+        )
+        # UNREAD is deliberately left alone. The date-bounded query already keeps
+        # these out of the next run, and with ~80k unread messages in this
+        # mailbox the flag plainly is not ours to manage -- Groove collects the
+        # mail and nothing marks it read. The label stays, for auditing.
+        return {
+            "label_key": "skipped_stale",
+            "skipped_reason": "stale",
+            "remove_unread": False,
+            "message": f"Older than {MAX_MESSAGE_AGE_HOURS}h. Skipped, no reply.",
+        }
+
+    # -- Gate 5: a human agent is already answering in this thread.
+    thread_match = thread_has_human_reply(service, message.get("threadId"), own_email)
+    if thread_match:
+        print(
+            f"[SKIP] Message {message['id']}: a human agent has replied in this thread "
+            f"({thread_match['message_id']!r} {thread_match['subject']!r})."
+        )
+        return {
+            "label_key": "skipped_human",
+            "skipped_reason": "human",
+            "remove_unread": True,
+            "matched_by": thread_match["source"],
+            "matched_message_id": thread_match["message_id"],
+            "matched_subject": thread_match["subject"],
+            "message": "A human agent is handling this thread. Skipped, no reply.",
+        }
+
+    # -- Gate 6: a human agent has written to this customer recently, in any
+    # thread at all. Groove rewrites the threading headers, so gate 5 simply
+    # cannot see most agent replies. Last gate before anything expensive: the
+    # reply generation after it is the Claude call.
+    customer_address = parseaddr(sender)[1] or sender
+    agent_match, check_failed = agent_replied_to_address(
+        service, own_email, customer_address, agent_search_cache
+    )
+    if check_failed:
+        # UNREAD stays on: a one-off network error must not bury the message.
+        # The next run retries it, and a failure that never clears ends at the
+        # age gate after MAX_MESSAGE_AGE_HOURS, so this cannot loop forever.
+        print(
+            f"[SKIP] Message {message['id']}: agent lookup failed — "
+            f"left UNREAD for the next run rather than answering."
+        )
+        return {
+            "label_key": "check_failed",
+            "skipped_reason": "human_check_failed",
+            "remove_unread": False,
+            "customer": customer_address,
+            "message": "Could not check for agent involvement. Left unread for a retry, no reply.",
+        }
+    if agent_match:
+        print(
+            f"[SKIP] Message {message['id']}: an agent wrote to {customer_address} recently "
+            f"({agent_match['message_id']!r} {agent_match['subject']!r})."
+        )
+        return {
+            "label_key": "skipped_human",
+            "skipped_reason": "human",
+            "remove_unread": True,
+            "customer": customer_address,
+            "matched_by": agent_match["source"],
+            "matched_message_id": agent_match["message_id"],
+            "matched_subject": agent_match["subject"],
+            "message": "A human agent is handling this customer. Skipped, no reply.",
+        }
+
+    return None
+
+
+SENSITIVE_ESCALATION_REASON = "SENSITIVE: Threats or legal language detected"
+
+
+def _handle_sensitive_message(
+    service, message, sender, subject, email_content, dry_run, label_ids, own_email,
+    agent_search_cache,
+):
+    """Threats and legal language: always page ops, answer only if nobody else is.
+
+    This used to run after every gate, so a threat from a customer an agent was
+    handling, or one that had sat for 12 hours, never reached the team at all.
+
+    The notification goes out every time. The fixed template goes to the
+    customer only when gates 4-6 would have let the message through. With an
+    agent already in the conversation, a canned reply on top of them is the
+    talking-over-an-agent bug from September, and on a threat of all messages.
+    Generated text never goes out here either way: Claude is not called.
+    """
+    escalation_result = escalate_email(
+        service, sender, subject, email_content, SENSITIVE_ESCALATION_REASON,
+        priority="SENSITIVE", dry_run=dry_run,
+    )
+    result = {
+        "processed": True,
+        "subject": subject,
+        "label_key": "escalated",
+        "escalated": True,
+        "escalation_reason": SENSITIVE_ESCALATION_REASON,
+        # No category: this reply is the fixed constant, not a KB template.
+        "escalation_category": None,
+        "escalation": escalation_result,
+    }
+
+    blocker = _reply_blocker(service, message, sender, own_email, agent_search_cache)
+    if blocker:
+        print(
+            f"[SENSITIVE] Message {message['id']}: ops notified, customer reply withheld "
+            f"({blocker['skipped_reason']})."
+        )
+        # Labelled escalated and marked read even after a failed lookup: a
+        # retry would page the team a second time, and they already have it.
+        _finalize_message_labels(service, message["id"], label_ids, "escalated", dry_run=dry_run)
+        result["customer_replied"] = False
+        result["reply_withheld"] = blocker["skipped_reason"]
+        for key in ("customer", "matched_by", "matched_message_id", "matched_subject"):
+            if key in blocker:
+                result[key] = blocker[key]
+        result["message"] = (
+            "Sensitive content detected. Escalated; no reply, "
+            f"the customer is not ours to answer ({blocker['skipped_reason']})."
+        )
+        return result
+
+    delivery = _deliver_customer_reply(
+        service, message, sender, subject, SENSITIVE_ESCALATION_REPLY, dry_run
+    )
+    _finalize_message_labels(service, message["id"], label_ids, "escalated", dry_run=dry_run)
+    result["delivery"] = delivery
+    result["customer_replied"] = True
+    result["message"] = "Sensitive content detected. Fixed template sent, escalated."
+    return _with_dry_run_reply(result, SENSITIVE_ESCALATION_REPLY, dry_run)
+
+
 def process_single_message(
     service, message, dry_run, label_ids, own_email="", agent_search_cache=None
 ):
@@ -1632,143 +1691,66 @@ def process_single_message(
             "message": "Service notification, not a customer request. Skipped, no reply.",
         }
 
-    # -- Gate 3: the message has been sitting too long to still be current.
-    # Local check, no API call, so it runs before anything expensive. The label
-    # and the cleared UNREAD flag matter as much as the skip: left unread, these
-    # would be re-listed every run and crowd fresh mail out of the scan budget.
-    if is_stale_message(message):
-        age = message_age_hours(message)
-        age_text = f"{age:.1f}h" if age is not None else "unknown age"
-        print(
-            f"[SKIP] Message {message['id']}: {age_text} old "
-            f"(limit {MAX_MESSAGE_AGE_HOURS}h) — an agent has almost certainly handled it."
-        )
-        # UNREAD is deliberately left alone. The date-bounded query already keeps
-        # these out of the next run, and with ~80k unread messages in this
-        # mailbox the flag plainly is not ours to manage -- Groove collects the
-        # mail and nothing marks it read. The label stays, for auditing.
-        _finalize_message_labels(
-            service,
-            message["id"],
-            label_ids,
-            "skipped_stale",
-            remove_unread=False,
-            dry_run=dry_run,
-        )
+    # Mailing lists and marketing: service mail too, counted on its own.
+    if is_bulk_mail(headers):
+        print(f"[SKIP] Message {message['id']}: {BULK_MAIL_HEADER} present ({subject!r}).")
+        _finalize_message_labels(service, message["id"], label_ids, "skipped_service", dry_run=dry_run)
         return {
             "processed": False,
-            "label_key": "skipped_stale",
-            "skipped_reason": "stale",
+            "label_key": "skipped_service",
+            "skipped_reason": "bulk",
             "subject": subject,
-            "message": f"Older than {MAX_MESSAGE_AGE_HOURS}h. Skipped, no reply.",
+            "message": "Mailing list or marketing mail. Skipped, no reply.",
         }
 
-    # -- Gate 4: a human agent is already answering in this thread.
-    thread_match = thread_has_human_reply(service, message.get("threadId"), own_email)
-    if thread_match:
-        print(
-            f"[SKIP] Message {message['id']}: a human agent has replied in this thread "
-            f"({thread_match['message_id']!r} {thread_match['subject']!r})."
-        )
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_human", dry_run=dry_run)
-        return {
-            "processed": False,
-            "label_key": "skipped_human",
-            "skipped_reason": "human",
-            "subject": subject,
-            "matched_by": thread_match["source"],
-            "matched_message_id": thread_match["message_id"],
-            "matched_subject": thread_match["subject"],
-            "message": "A human agent is handling this thread. Skipped, no reply.",
-        }
-
-    # -- Gate 5: a human agent has written to this customer recently, in any
-    # thread at all. Groove rewrites the threading headers, so gate 4 simply
-    # cannot see most agent replies. Last gate before anything expensive: the
-    # reply generation below is the Claude call.
-    customer_address = parseaddr(sender)[1] or sender
-    agent_match, check_failed = agent_replied_to_address(
-        service, own_email, customer_address, agent_search_cache
-    )
-    if check_failed:
-        print(f"[SKIP] Message {message['id']}: agent lookup failed — skipping rather than answering.")
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_human", dry_run=dry_run)
-        return {
-            "processed": False,
-            "label_key": "skipped_human",
-            "skipped_reason": "human_check_failed",
-            "subject": subject,
-            "customer": customer_address,
-            "message": "Could not check for agent involvement. Skipped, no reply.",
-        }
-    if agent_match:
-        print(
-            f"[SKIP] Message {message['id']}: an agent wrote to {customer_address} recently "
-            f"({agent_match['message_id']!r} {agent_match['subject']!r})."
-        )
-        _finalize_message_labels(service, message["id"], label_ids, "skipped_human", dry_run=dry_run)
-        return {
-            "processed": False,
-            "label_key": "skipped_human",
-            "skipped_reason": "human",
-            "subject": subject,
-            "customer": customer_address,
-            "matched_by": agent_match["source"],
-            "matched_message_id": agent_match["message_id"],
-            "matched_subject": agent_match["subject"],
-            "message": "A human agent is handling this customer. Skipped, no reply.",
-        }
+    # Auto-replies go before the sensitive check: an out-of-office saying "in
+    # court today" would page ops, get the fixed template, and answer it with
+    # another out-of-office -- a loop.
+    if is_auto_reply(subject, sender):
+        _finalize_message_labels(service, message["id"], label_ids, add_label_key=None, dry_run=dry_run)
+        return {"processed": False, "label_key": None, "message": "Auto-reply or bounce-back detected. Skipped."}
 
     # Message-ID/References are read by _deliver_customer_reply() from the same
     # headers, so they are not pulled out here any more.
     email_content = message_text(message.get("payload", {}))[:MAX_EMAIL_CHARS]
-    if not sender:
-        raise RuntimeError("Unread email does not contain a sender address.")
-    if not email_content:
-        raise RuntimeError("Unread email does not contain readable text.")
 
     # Reply clients append quoted thread history below the new text. Rule-based
     # checks below must react to what the customer just wrote, not to an older
     # message quoted further down (e.g. a past refund request in the thread).
     latest_message, thread_context = split_latest_message(email_content)
 
-    # Check for auto-reply/bounce-back
-    if is_auto_reply(subject, sender):
-        _finalize_message_labels(service, message["id"], label_ids, add_label_key=None, dry_run=dry_run)
-        return {"processed": False, "label_key": None, "message": "Auto-reply or bounce-back detected. Skipped."}
-
-    # Check for sensitive content (threats/legal language). Deliberately never
-    # reaches Claude: generated text has no place in a reply to a threat or a
-    # legal notice. The customer still hears back, from a fixed template.
+    # -- Gate 3: threats and legal language. Ahead of the age and agent gates,
+    # so the team hears about them whoever is handling the customer.
     if detect_sensitive_content(latest_message, subject):
-        escalation_result = escalate_email(service, sender, subject, email_content, "SENSITIVE: Threats or legal language detected", priority="SENSITIVE", dry_run=dry_run)
-        delivery = _deliver_customer_reply(
-            service, message, sender, subject, SENSITIVE_ESCALATION_REPLY, dry_run
+        return _handle_sensitive_message(
+            service, message, sender, subject, email_content, dry_run, label_ids,
+            own_email, agent_search_cache,
         )
-        _finalize_message_labels(service, message["id"], label_ids, "escalated", dry_run=dry_run)
-        return _with_dry_run_reply(
-            {
-                "processed": True,
-                "subject": subject,
-                "delivery": delivery,
-                "message": "Sensitive content detected. Fixed template sent, escalated.",
-                "label_key": "escalated",
-                "escalated": True,
-                "escalation_reason": "SENSITIVE: Threats or legal language detected",
-                # No category: this reply is the fixed constant, not a KB template.
-                "escalation_category": None,
-                "escalation": escalation_result,
-            },
-            SENSITIVE_ESCALATION_REPLY,
-            dry_run,
+
+    # -- Gates 4-6: too old, or a person is already on it.
+    blocker = _reply_blocker(service, message, sender, own_email, agent_search_cache)
+    if blocker:
+        _finalize_message_labels(
+            service,
+            message["id"],
+            label_ids,
+            blocker["label_key"],
+            remove_unread=blocker.pop("remove_unread"),
+            dry_run=dry_run,
         )
+        return {"processed": False, "subject": subject, **blocker}
+
+    if not sender:
+        raise RuntimeError("Unread email does not contain a sender address.")
+    if not email_content:
+        raise RuntimeError("Unread email does not contain readable text.")
 
     # Check for escalation triggers
     escalation_check = detect_escalation_triggers(latest_message)
     if escalation_check["should_escalate"]:
         # The customer gets an answer here too. Returning silently is what made
         # a refund demand look ignored, which is how payment disputes start.
-        knowledge_base, kb_files = build_knowledge_base(email_content)
+        knowledge_base, kb_files = build_knowledge_base(email_content, subject)
         # The reply always goes out; the ops notification only the first time.
         # Now that this path keeps the conversation going, three "just refund
         # me" messages in a row would otherwise page the team three times.
@@ -1816,7 +1798,7 @@ def process_single_message(
         )
 
     # Generate reply
-    knowledge_base, kb_files = build_knowledge_base(email_content)
+    knowledge_base, kb_files = build_knowledge_base(email_content, subject)
     sender_display_name, sender_email = parseaddr(sender)
     raw_reply = generate_reply(
         latest_message,
@@ -1884,8 +1866,9 @@ def process_single_message(
 
 
 class handler(BaseHTTPRequestHandler):
-    """Process unread support emails. Triggered by manual POST (curl/testing)
-    or GET (Vercel Cron, which calls scheduled endpoints with GET)."""
+    """Process unread support emails. Triggered by POST from the run-bot
+    GitHub Actions workflow on its schedule, or by hand with curl. GET runs the
+    same processing."""
 
     def do_GET(self):
         self._process_request()

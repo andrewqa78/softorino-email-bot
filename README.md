@@ -41,8 +41,7 @@ softorino-email-bot/
 │   └── process_email.py
 ├── scripts/
 │   ├── check_kb_routing.py
-│   ├── check_message_rules.py
-│   └── diagnose_agent_replies.py
+│   └── check_message_rules.py
 ├── .github/workflows/
 │   ├── check-kb-routing.yml
 │   ├── check-message-rules.yml
@@ -52,9 +51,8 @@ softorino-email-bot/
 └── README.md
 ```
 
-The endpoint accepts both GET and POST (Vercel Cron calls scheduled
-endpoints with GET, manual/curl testing typically uses POST — both run
-the same processing and return the same JSON response) and processes
+The endpoint accepts both GET and POST (the scheduled run and manual curl
+testing both use POST; both run the same processing and return the same JSON) and processes
 up to 10 unread **threads** per run (1 second delay between each):
 
 1. **Filter at fetch time** — the Gmail query is bounded by `newer_than:`, derived from `MAX_MESSAGE_AGE_HOURS` (see below), and excludes senders (`noreply@`, `no-reply@`, `mailer-daemon@`) and subjects (unsubscribe, newsletter, notification, invoice, receipt, order confirmation, auto-reply, out of office) that are never real support requests
@@ -80,7 +78,7 @@ Without this, a customer who wrote five times between runs got five separate
 replies in ninety seconds -- and the angrier the customer, the more likely they
 were to write repeatedly. It happened in production.
 
-`MAX_EMAILS_PER_RUN` counts threads, not messages, so one talkative customer can
+`MAX_THREADS_PER_RUN` counts threads, not messages, so one talkative customer can
 no longer eat the run and leave everyone else waiting. The run lists
 `MAX_MESSAGES_SCANNED_PER_RUN` (5x the thread limit) messages before grouping,
 because several of them can collapse into one thread.
@@ -118,13 +116,19 @@ the thread carries the `AI_ESCALATED` label. That check used to grep message
 bodies for one fixed English sentence, which stopped working once the wording
 became per-category and per-language.
 
+A missing `ESCALATION_EMAIL_1`/`_2` is not silent. The run result carries
+`ops_notifications_skipped` (a count) and `ops_notifications_skipped_messages`
+(message id, customer, reason and `why`: `no_recipients` or `send_failed`).
+
 The customer is answered every time. Only the notification to the team is
 deduplicated -- three "just refund me" messages in a row get three replies and
 one page.
 
 ## Keeping KB routing in sync
 
-`relevant_kb_files()` picks knowledge base files from a hardcoded map. The files
+`relevant_kb_files()` picks knowledge base files from a hardcoded map. It reads the
+subject and the body together, with `Re:`/`Fwd:` stripped from the subject, so
+"Problems with Beamer" routes even when the body never names the product. The files
 themselves live in the separate `Softorino_Support_AI` repo, and nothing links
 the two. Renaming or adding a KB file there silently breaks routing here.
 
@@ -203,8 +207,9 @@ matter: bare substrings are what caused both bugs.
 
 ## Never talking over a person
 
-Five gates run before anything else, in this order. Each one labels the message
-and returns. Nothing is sent to the customer and Claude is never called.
+Six gates run before Claude, in this order. Except for gate 3, each one labels
+the message and returns: nothing is sent to the customer and Claude is never
+called.
 
 1. **Mail from our own mailbox.** `From` matching the authenticated account is
    dropped immediately. This covers our own autoresponder and makes a reply loop
@@ -212,26 +217,34 @@ and returns. Nothing is sent to the customer and Claude is never called.
    `GMAIL_USER_EMAIL`, so a typo in the env var cannot silently disable the check.
 2. **Service mail.** Subjects starting with a `SERVICE_SUBJECT_PREFIXES` entry
    (`[AI Chat]`, Quidget's agent notifications) or containing a
-   `SERVICE_SUBJECT_TERMS` entry (our autoresponder). Both lists are meant to
-   grow. Leading `Re:` / `RE:` / `Fwd:` / `FW:` / `Re[2]:` markers, including
-   chains of them, are stripped first: without that, `Re: [AI Chat] License
-   Recovery` reads as a customer request the moment anyone replies, which is
-   what happened on a live run. Subjects that merely start with those letters
-   (`Refund`, `Reply needed:`, `Regarding:`, `Forward my licence`) are left
-   alone.
-3. **The message is older than `MAX_MESSAGE_AGE_HOURS` (12).** The check reads
-   `internalDate` locally, so it runs before the gate below, which costs an API
-   call. A missing or unparseable `internalDate` counts as stale. This is a
-   backstop, not the main filter -- see below.
-4. **A human agent already replied in the thread.** Every message the bot sends
+   `SERVICE_SUBJECT_TERMS` entry (our autoresponder). Leading `Re:` / `Fwd:` /
+   `FW:` / `Re[2]:` markers, including chains of them, are stripped first.
+   Mail with a `List-Unsubscribe` header is dropped here too, as `bulk`
+   (`skipped_bulk`): customers do not send it, marketing mail always does.
+   Auto-replies and bounces are dropped at this point as well, before the
+   sensitive check -- an out-of-office saying "in court today" must not page ops.
+3. **Sensitive content.** Threats and legal language. This sits ahead of the
+   age and agent gates on purpose: a threat from a customer an agent is handling,
+   or one that sat for 12 hours, used to reach nobody. **Ops is always
+   notified.** The fixed reply goes to the customer only when gates 4-6 would
+   have let the message through. With an agent in the conversation, or a lookup
+   that failed, the team is paged and the customer gets nothing -- a canned
+   reply on top of an agent is the September bug. The result says
+   `customer_replied` and, when withheld, `reply_withheld`.
+4. **The message is older than `MAX_MESSAGE_AGE_HOURS` (12).** The check reads
+   `internalDate` locally, so it runs before the two lookups. A missing or
+   unparseable `internalDate` counts as stale. This is a backstop, not the main
+   filter -- see below.
+5. **A human agent already replied in the thread.** Every message the bot sends
    carries `X-Softorino-Bot: 1`. An outgoing message in the thread without that
-   header, and without a service subject, was written by a person.
-5. **A human agent wrote to this customer recently, in any thread.** Searches
+   header, and without a service or ops-notification subject, was written by a
+   person.
+6. **A human agent wrote to this customer recently, in any thread.** Searches
    `from:<us> to:<customer> newer_than:14d`, up to 20 results, and stops at the
-   first agent message. Last gate before the Claude call. Results are cached per
-   address for the run, so two messages from one customer cost one lookup. A
-   failed lookup skips the message and is reported as `human_check_failed`, kept
-   apart from real hits so a broken query cannot pass for the gate working.
+   first agent message. Results are cached per address for the run. A failed
+   lookup gets the `AI_CHECK_FAILED` label and **keeps UNREAD**, so the next run
+   tries again. A failure that never clears ends at gate 4 after 12 hours.
+   Reported as `human_check_failed`, kept apart from real hits.
 
 ### The unread flag means nothing here
 
@@ -254,25 +267,26 @@ messages are inside the date window and would otherwise be re-listed every run.
 
 ### What counts as an agent
 
-`is_agent_message()` is the one place that decides, and both gate 4 and gate 5
+`is_agent_message()` is the one place that decides, and gates 5 and 6
 use it. An outgoing message is an agent's only when it has **no**
-`X-Softorino-Bot` header **and** its subject is not service mail.
+`X-Softorino-Bot` header **and** its subject is neither service mail nor an
+ops notification.
 
 The second condition is not optional. The autoresponder ("Your Softorino support
 request has been received") goes out from the same address, unstamped, to every
 customer. On "unstamped means agent" alone, every ticket would look
 human-handled and the bot would answer nobody -- three of the six apparent agent
-replies the mailbox diagnostic found were exactly this. It reuses
+replies found in the mailbox were exactly this. It reuses
 `SERVICE_SUBJECT_PREFIXES` and `SERVICE_SUBJECT_TERMS`, the same lists gate 2
 matches on.
 
-Gate 4 exists because thread grouping cannot see this. A Groove ticket and a
+Gate 5 exists because thread grouping cannot see this. A Groove ticket and a
 Gmail thread are not the same thing: an agent replying through Groove often
 lands outside the original conversation, so Gmail shows several threads where
 Groove shows one. Deduplication looked correct while the customer collected
 three different answers from "one" team.
 
-Two things follow from gate 4 and are intentional:
+Two things follow from gate 5 and are intentional:
 
 - Mail the bot sent before this header existed carries no stamp, so those
   threads now read as human-handled and the bot stays quiet in them.
@@ -287,35 +301,21 @@ nearly empty backlog from a growing one. It is `null` if the lookup fails, which
 does not stop the run.
 
 The run result reports `skipped_human_handled`, `skipped_service_mail`,
-`skipped_own_mail`, `skipped_stale` and `human_check_failed`, plus
+`skipped_bulk`, `skipped_own_mail`, `skipped_stale` and `human_check_failed`, plus
 `human_gate_hits`: one entry per human-gate hit naming the message that
 triggered it, which gate matched and the id and subject it matched against.
 Without that list there is no way to tell the gate working from the gate
 silencing everything.
 
-### Diagnostic mode (temporary)
+### Ops notifications are not agents
 
-Whether a Gmail-side check can work at all depends on one unanswered question:
-do Groove-sent agent replies reach this mailbox? Setting `DIAGNOSTIC_ADDRESSES`
-in Vercel to a comma-separated list of customer addresses turns the next run
-into a read-only report instead of a processing run.
-
-In that mode the function lists `to:<address>` and `from:<address>` over the
-last 14 days, pulls `Date`, `From`, `To`, `Subject`, `Message-ID`,
-`X-Softorino-Bot` and `threadId` for each hit, and returns the lot in the JSON
-response, where the `run-bot` workflow log already shows it. It never lists the
-unread queue, calls Claude, sends anything, applies a label or clears `UNREAD`.
-The check runs before the `ALLOWED_SENDERS` guard, so the report does not depend
-on how that switch is set.
-
-To run it: set `DIAGNOSTIC_ADDRESSES` in Vercel, Redeploy, then Actions →
-`run-bot` → Run workflow. **Clear the variable and Redeploy afterwards**, or the
-bot will keep reporting instead of answering mail.
-
-This is temporary. Delete `DIAGNOSTIC_ADDRESSES`, `run_mailbox_diagnostic()` and
-the branch at the top of `process_unread_emails()` once the question is settled.
-`scripts/diagnose_agent_replies.py` does the same thing from a terminal, for
-anyone who has the credentials to hand.
+`escalate_email()` sends `[ESCALATION]`, `[HIGH PRIORITY]` or `[SENSITIVE]`
+notifications from our own mailbox. Without a rule for them, `is_agent_message()`
+read each one as an agent writing to that address, and every `ESCALATION_EMAIL`
+recipient was silenced the first time it was paged. A subject starting with one
+of those prefixes, after `Re:`/`Fwd:` are stripped, is not an agent. The
+notification carries `X-Softorino-Bot` as well. The prefixes are not service
+subjects: a customer writing "[HIGH PRIORITY] app broken" still gets answered.
 
 ## DRY_RUN
 
@@ -347,7 +347,7 @@ carried.
 
 ## Gmail label-based state tracking
 
-The bot creates and manages 7 Gmail labels to track processing state per
+The bot creates and manages 8 Gmail labels to track processing state per
 message and avoid duplicate customer replies across runs (e.g. if a run
 crashes after sending a reply but before marking the email read):
 
@@ -358,18 +358,19 @@ crashes after sending a reply but before marking the email read):
 - `AI_SKIPPED_HUMAN` — a human agent had already replied in the thread
 - `AI_SKIPPED_SERVICE` — service mail, or mail from our own mailbox
 - `AI_SKIPPED_STALE` — older than `MAX_MESSAGE_AGE_HOURS` when the run reached it
+- `AI_CHECK_FAILED` — the agent lookup failed; UNREAD is kept and the next run retries
 
 Any message that already carries `AI_REPLIED` or `AI_ESCALATED` is skipped
 entirely on future runs, even if it somehow reappears as unread.
 
 **Escalation priorities:**
-- `[SENSITIVE]` — Threats, legal language, or abuse (no auto-reply sent)
+- `[SENSITIVE]` — Threats, legal language, or abuse (fixed template only, and only when no agent is involved)
 - `[HIGH PRIORITY]` — Fraud or scam reports (escalate to ops immediately)
 - `[ESCALATION]` — Billing/refund/cancellation requests, unknown topics, payment failures
 
 Send a `GET` or `POST` request to `/api/process_email` to run the processing
 flow — for example `curl -s -X POST .../api/process_email` for manual
-testing, or let Vercel Cron trigger it on schedule via GET.
+testing, or let the `run-bot` GitHub Actions workflow call it on schedule.
 
 ## Endpoint authentication
 
@@ -384,9 +385,8 @@ To configure it:
 
 1. Generate a random secret, e.g. `openssl rand -hex 32`.
 2. Add it to the Vercel project as environment variable `CRON_SECRET`.
-3. Vercel automatically sends this same value as the `Authorization: Bearer`
-   header on every Cron-triggered request to your project, so scheduled runs
-   need no extra setup once the env var is set.
+3. The `run-bot` workflow sends the same value from its `CRON_SECRET`
+   repository secret, so both must match.
 4. For manual/curl testing, add the header yourself:
    ```bash
    curl -s -X POST https://your-deployment.vercel.app/api/process_email \

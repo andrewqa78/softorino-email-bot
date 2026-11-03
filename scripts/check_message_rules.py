@@ -484,6 +484,7 @@ LABEL_IDS = {
     "skipped_human": "L5",
     "skipped_service": "L6",
     "skipped_stale": "L7",
+    "check_failed": "L8",
 }
 ESCALATED_LABEL = LABEL_IDS["escalated"]
 OWN_MAILBOX = "support@softorino.app"
@@ -574,6 +575,20 @@ class FakeGmailService:
                 return entry[1].get("addLabelIds", [])
         return []
 
+    def removed_labels(self):
+        for entry in self.actions:
+            if entry[0] == "modify":
+                return entry[1].get("removeLabelIds", [])
+        return []
+
+    def ops_sends(self):
+        """Ops notifications: sent as brand-new messages, no threadId."""
+        return [body for kind, body in self.actions if kind == "send" and "threadId" not in body]
+
+    def customer_sends(self):
+        """Live customer replies: always sent into the customer's thread."""
+        return [body for kind, body in self.actions if kind == "send" and "threadId" in body]
+
 
 def _epoch_ms_hours_ago(hours):
     return str(int((time.time() - hours * 3600) * 1000))
@@ -585,6 +600,7 @@ def _incoming(
     sender="Andrew Q <andrew@example.com>",
     age_hours=0.5,
     internal_date=_UNSET,
+    extra_headers=None,
 ):
     raw = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii")
     message = {
@@ -597,6 +613,7 @@ def _incoming(
                 {"name": "From", "value": sender},
                 {"name": "Subject", "value": subject},
                 {"name": "Message-ID", "value": "<abc@mail>"},
+                *(extra_headers or []),
             ],
             "body": {"data": raw},
         },
@@ -635,10 +652,12 @@ def _run_message(
     agent_search_rows=None,
     cache=None,
     dry_run=True,
+    extra_headers=None,
+    service=None,
 ):
-    service = FakeGmailService(thread, agent_search_rows)
+    service = service or FakeGmailService(thread, agent_search_rows)
     CLAUDE_CALLS.clear()
-    incoming = _incoming(body, subject, sender, age_hours, internal_date)
+    incoming = _incoming(body, subject, sender, age_hours, internal_date, extra_headers)
     result = _quiet(
         lambda: bot.process_single_message(
             service,
@@ -673,7 +692,7 @@ def check_end_to_end():
 
     # The bot must not reach GitHub for the knowledge base during tests.
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
 
@@ -959,6 +978,10 @@ class FakeMailbox:
         self.sent = []
         self.modifies = []
         self.list_calls = []
+        # Extra headers per message id, e.g. List-Unsubscribe.
+        self.extra_headers = {}
+        self.agent_search_raises = False
+        self.ops_send_raises = False
 
     # -- state helpers used by the checks --
     def labels_of(self, msg_id):
@@ -1002,6 +1025,8 @@ class _MailboxMessages:
         self.mb.list_calls.append({"q": q, "maxResults": maxResults})
         # "from:us to:customer ..." is the agent lookup, not the unread queue.
         if (q or "").startswith(f"from:{OWN_MAILBOX}"):
+            if self.mb.agent_search_raises:
+                raise RuntimeError("Gmail search timed out")
             return _Call({"messages": [{"id": r["id"]} for r in self.mb.agent_search_rows]})
         return _Call({"messages": self.mb.refs[:maxResults]})
 
@@ -1030,6 +1055,7 @@ class _MailboxMessages:
                 {"name": "From", "value": self.mb.sender},
                 {"name": "Subject", "value": stored["subject"]},
                 {"name": "Message-ID", "value": f"<{stored['id']}@mail>"},
+                *self.mb.extra_headers.get(stored["id"], []),
             ],
             "body": {"data": body},
         }
@@ -1047,6 +1073,8 @@ class _MailboxMessages:
         return _Call({})
 
     def send(self, userId=None, body=None):
+        if self.mb.ops_send_raises and "threadId" not in body:
+            raise RuntimeError("SMTP said no")
         self.mb.sent.append(body)
         return _Call({"id": "sent-1"})
 
@@ -1089,7 +1117,7 @@ def _run_environment(mailbox):
     original_kb = bot.build_knowledge_base
     original_delay = bot.DELAY_BETWEEN_EMAILS_SECONDS
     bot.gmail_service = lambda: mailbox
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     bot.DELAY_BETWEEN_EMAILS_SECONDS = 0
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
@@ -1140,7 +1168,7 @@ def check_human_and_service_gates():
         failures.append(label)
 
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
 
@@ -1291,7 +1319,7 @@ def check_outgoing_stamp():
         failures.append(label)
 
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     try:
         service, _result = _run_message("My app will not start", thread={"messages": []})
         reply = service.customer_reply() or ""
@@ -1418,7 +1446,7 @@ def check_subject_normalisation():
         )
 
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
     try:
@@ -1467,7 +1495,7 @@ def check_unread_total():
         failures.append(label)
 
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
     try:
@@ -1521,7 +1549,7 @@ def check_dry_run():
         failures.append(label)
 
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
 
@@ -1713,7 +1741,7 @@ def check_agent_lookup():
         failures.append(label)
 
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
 
@@ -1919,7 +1947,7 @@ def check_message_age():
         failures.append(label)
 
     original_kb = bot.build_knowledge_base
-    bot.build_knowledge_base = lambda content: ("KB TEXT", ["tone_of_voice.md"])
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
     os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
     os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
 
@@ -2203,19 +2231,19 @@ def check_thread_grouping():
     #    customer starves the rest of the run.
     expect(
         "the list call scans past the thread limit",
-        mailbox.list_calls[0]["maxResults"] > bot.MAX_EMAILS_PER_RUN,
-        f"maxResults={mailbox.list_calls[0]['maxResults']}, limit={bot.MAX_EMAILS_PER_RUN}",
+        mailbox.list_calls[0]["maxResults"] > bot.MAX_THREADS_PER_RUN,
+        f"maxResults={mailbox.list_calls[0]['maxResults']}, limit={bot.MAX_THREADS_PER_RUN}",
     )
 
     # 6. Thread count, not message count, is what the limit caps.
     many = []
-    for index in range(bot.MAX_EMAILS_PER_RUN + 3):
+    for index in range(bot.MAX_THREADS_PER_RUN + 3):
         many.append((f"g{index}", f"tg{index}", 1000, "Question"))
     mailbox = FakeMailbox(many)
     result = _run(mailbox)
     expect(
-        "no more than MAX_EMAILS_PER_RUN threads per run",
-        result.get("processed_count") == bot.MAX_EMAILS_PER_RUN,
+        "no more than MAX_THREADS_PER_RUN threads per run",
+        result.get("processed_count") == bot.MAX_THREADS_PER_RUN,
         f"processed_count={result.get('processed_count')}",
     )
 
@@ -2260,110 +2288,7 @@ def check_thread_grouping():
     return failures
 
 
-# --- diagnostic mode (TEMPORARY) --------------------------------------------
-# DIAGNOSTIC_ADDRESSES turns a deployed run into a read-only report. The whole
-# value of it rests on one promise -- that it touches nothing -- so that is what
-# these checks are mostly about.
-
-
-class FakeDiagnosticMailbox:
-    """Answers Gmail queries from a canned map and records every call made."""
-
-    def __init__(self, rows_by_query):
-        self.rows_by_query = rows_by_query
-        self.calls = []
-        self._by_id = {}
-        for rows in rows_by_query.values():
-            for row in rows:
-                self._by_id[row["id"]] = row
-
-    # -- api surface --
-    def users(self):
-        return self
-
-    def messages(self):
-        return self
-
-    def drafts(self):
-        return self
-
-    def labels(self):
-        return self
-
-    def threads(self):
-        return self
-
-    def getProfile(self, userId=None):
-        self.calls.append(("getProfile",))
-        return _Call({"emailAddress": OWN_MAILBOX})
-
-    def list(self, userId=None, q=None, maxResults=None):
-        self.calls.append(("list", q))
-        for fragment, rows in self.rows_by_query.items():
-            if fragment in (q or ""):
-                return _Call({"messages": [{"id": r["id"]} for r in rows]})
-        return _Call({"messages": []})
-
-    def get(self, userId=None, id=None, format=None, metadataHeaders=None):
-        self.calls.append(("get", id, format))
-        row = self._by_id[id]
-        headers = [
-            {"name": "Date", "value": row.get("date", "")},
-            {"name": "From", "value": row["from"]},
-            {"name": "To", "value": row.get("to", "")},
-            {"name": "Subject", "value": row.get("subject", "")},
-            {"name": "Message-ID", "value": row.get("message_id", "")},
-        ]
-        if row.get("stamped"):
-            headers.append({"name": bot.BOT_HEADER_NAME, "value": bot.BOT_HEADER_VALUE})
-        return _Call({"id": id, "threadId": row["threadId"], "payload": {"headers": headers}})
-
-    # -- anything below would be a write; none of it may be called --
-    def create(self, **kwargs):
-        raise AssertionError("diagnostic mode created a draft or a label")
-
-    def send(self, **kwargs):
-        raise AssertionError("diagnostic mode sent mail")
-
-    def modify(self, **kwargs):
-        raise AssertionError("diagnostic mode modified labels")
-
-
-@contextlib.contextmanager
-def diagnostic_env(value):
-    previous = os.environ.get("DIAGNOSTIC_ADDRESSES")
-    if value is None:
-        os.environ.pop("DIAGNOSTIC_ADDRESSES", None)
-    else:
-        os.environ["DIAGNOSTIC_ADDRESSES"] = value
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("DIAGNOSTIC_ADDRESSES", None)
-        else:
-            os.environ["DIAGNOSTIC_ADDRESSES"] = previous
-
-
-CUSTOMER = "johnsonwjsn@gmail.com"
-
-
-def _row(msg_id, thread_id, sender, stamped=False):
-    return {
-        "id": msg_id,
-        "threadId": thread_id,
-        "from": sender,
-        "to": CUSTOMER,
-        "subject": "Re: OrderID UxGCq8ouRE",
-        "date": "Mon, 28 Sep 2026 10:00:00 +0000",
-        "message_id": f"<{msg_id}@mail>",
-        "stamped": stamped,
-    }
-
-
-def check_diagnostic_mode():
-    failures = []
-
+def _expecter(failures):
     def expect(label, condition, detail=""):
         if condition:
             print(f"  ok    {label}")
@@ -2371,150 +2296,783 @@ def check_diagnostic_mode():
         print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
         failures.append(label)
 
-    with diagnostic_env(None):
-        expect("unset variable means a normal run", bot.diagnostic_addresses() == [])
-    with diagnostic_env("   "):
-        expect("blank variable means a normal run", bot.diagnostic_addresses() == [])
-    with diagnostic_env(f" {CUSTOMER} , second@example.com ,, "):
+    return expect
+
+
+@contextlib.contextmanager
+def escalation_env(first, second=None):
+    """Set ESCALATION_EMAIL_1/_2, or remove them when None."""
+    names = ("ESCALATION_EMAIL_1", "ESCALATION_EMAIL_2")
+    previous = {name: os.environ.get(name) for name in names}
+    for name, value in zip(names, (first, second)):
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _decoded(body):
+    return base64.urlsafe_b64decode(body["raw"]).decode("utf-8")
+
+
+# --- sensitive content goes ahead of the age and agent gates ----------------
+# Behind them, a threat from a customer an agent was handling, or one that had
+# sat for 12 hours, never reached the team. The notification has to go out
+# every time; the fixed reply only where the bot would answer anyway, or it is
+# the September bug again: a canned reply on top of an agent.
+THREAT = "I'll sue you, I am calling my lawyer"
+
+
+def check_sensitive_gate():
+    failures = []
+    expect = _expecter(failures)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+
+    def notified_not_answered(label, service, result, withheld):
         expect(
-            "addresses are split and trimmed",
-            bot.diagnostic_addresses() == [CUSTOMER, "second@example.com"],
-            f"got {bot.diagnostic_addresses()}",
+            f"{label}: ops is notified",
+            len(service.ops_sends()) == 1,
+            f"ops sends={len(service.ops_sends())}",
+        )
+        expect(
+            f"{label}: the customer gets nothing",
+            not service.customer_sends() and service.customer_reply() is None,
+            f"customer sends={len(service.customer_sends())}",
+        )
+        expect(f"{label}: Claude is not called", not CLAUDE_CALLS, f"{len(CLAUDE_CALLS)} call(s)")
+        expect(
+            f"{label}: labelled AI_ESCALATED",
+            service.added_labels() == [ESCALATED_LABEL],
+            f"added={service.added_labels()}",
+        )
+        expect(
+            f"{label}: the result says why the reply was withheld",
+            result.get("escalated") is True
+            and result.get("customer_replied") is False
+            and result.get("reply_withheld") == withheld,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
         )
 
-    original_service = bot.gmail_service
+    try:
+        # 1. An agent is in the thread.
+        service, result = _run_message(
+            THREAT, thread={"messages": [_outgoing("agent-1", stamped=False)]}, dry_run=False
+        )
+        notified_not_answered("sensitive + agent in thread", service, result, "human")
 
-    def run_with(rows_by_query, env_value=CUSTOMER, allowed=None):
-        mailbox = FakeDiagnosticMailbox(rows_by_query)
-        bot.gmail_service = lambda: mailbox
-        CLAUDE_CALLS.clear()
-        try:
-            with diagnostic_env(env_value), allowed_senders_env(allowed):
-                return mailbox, _quiet(bot.process_unread_emails)
-        finally:
-            bot.gmail_service = original_service
+        # 2. An agent wrote to this customer from another thread.
+        service, result = _run_message(
+            THREAT, thread={"messages": []}, agent_search_rows=[AGENT_MAIL], dry_run=False
+        )
+        notified_not_answered("sensitive + agent by address", service, result, "human")
+        expect(
+            "sensitive + agent by address: the match is named for audit",
+            result.get("matched_message_id") == "agent-1",
+            f"result={result!r}",
+        )
 
-    # 1. An agent replied, in a thread of its own -- the production situation.
-    mailbox, result = run_with({
-        f"to:{CUSTOMER}": [
-            _row("agent-1", "thread-AGENT", "Amy <support@softorino.app>", stamped=False),
-            _row("bot-1", "thread-CUST", "Softorino <support@softorino.app>", stamped=True),
-        ],
-        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
-    })
-    verdict = result["report"][CUSTOMER]["verdict"]
-    expect("the run is flagged as a diagnostic", result.get("diagnostic") is True)
-    expect("no mail is processed", "processed_count" not in result, f"keys={sorted(result)}")
-    expect("Claude is never called", not CLAUDE_CALLS)
-    expect(
-        "the unread queue is never listed",
-        all("is:unread" not in (call[1] or "") for call in mailbox.calls if call[0] == "list"),
-        f"queries={[c[1] for c in mailbox.calls if c[0] == 'list']}",
-    )
-    expect(
-        "both queries are issued with the 14 day window",
-        sorted(c[1] for c in mailbox.calls if c[0] == "list")
-        == sorted([f"from:{CUSTOMER} newer_than:14d", f"to:{CUSTOMER} newer_than:14d"]),
-        f"queries={[c[1] for c in mailbox.calls if c[0] == 'list']}",
-    )
-    expect(
-        "metadata format is used, not full",
-        all(call[2] == "metadata" for call in mailbox.calls if call[0] == "get"),
-    )
-    expect(
-        "the agent reply is counted, the bot reply is not",
-        verdict["agent_replies_found"] == 1 and verdict["bot_replies_found"] == 1,
-        f"verdict={verdict}",
-    )
-    expect(
-        "the agent thread is reported as separate from the customer's",
-        verdict["agent_threads_separate"] == ["thread-AGENT"]
-        and verdict["agent_threads_shared_with_customer"] == [],
-        f"verdict={verdict}",
-    )
-    expect(
-        "the overall verdict points at step 2",
-        "step 2" in result["verdict"],
-        f"verdict={result['verdict']!r}",
-    )
-    expect(
-        "the raw messages are returned for both directions",
-        len(result["report"][CUSTOMER]["messages_to"]) == 2
-        and len(result["report"][CUSTOMER]["messages_from"]) == 1,
-    )
+        # 3. Older than 12 hours: used to be dropped before anyone looked.
+        service, result = _run_message(
+            THREAT, thread={"messages": []}, age_hours=13, dry_run=False
+        )
+        notified_not_answered("sensitive + older than 12h", service, result, "stale")
+        service, result = _run_message(
+            THREAT, thread={"messages": []}, age_hours=200, dry_run=False
+        )
+        expect(
+            "sensitive + 200h old: ops is still notified",
+            len(service.ops_sends()) == 1 and not service.customer_sends(),
+            f"ops={len(service.ops_sends())}, customer={len(service.customer_sends())}",
+        )
 
-    # 2. Only bot replies: the answer has to point at the Groove API.
-    mailbox, result = run_with({
-        f"to:{CUSTOMER}": [_row("bot-1", "thread-CUST", "Softorino <support@softorino.app>", stamped=True)],
-        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
-    })
-    verdict = result["report"][CUSTOMER]["verdict"]
-    expect(
-        "a mailbox with no agent replies says so",
-        verdict["agent_replies_found"] == 0,
-        f"verdict={verdict}",
-    )
-    expect(
-        "the overall verdict points at the Groove API",
-        "Groove API" in result["verdict"],
-        f"verdict={result['verdict']!r}",
-    )
+        # 4. The agent lookup failed: notify, but do not guess at answering.
+        class BrokenSearch(FakeGmailService):
+            def list(self, userId=None, q=None, maxResults=None):
+                raise RuntimeError("Gmail is having a moment")
 
-    # 3. An agent replying inside the customer's own thread.
-    mailbox, result = run_with({
-        f"to:{CUSTOMER}": [_row("agent-1", "thread-CUST", "Amy <support@softorino.app>")],
-        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
-    })
-    verdict = result["report"][CUSTOMER]["verdict"]
-    expect(
-        "an agent reply in the customer's thread is reported as shared",
-        verdict["agent_threads_shared_with_customer"] == ["thread-CUST"]
-        and verdict["agent_threads_separate"] == [],
-        f"verdict={verdict}",
-    )
+        service, result = _run_message(
+            THREAT, service=BrokenSearch({"messages": []}), dry_run=False
+        )
+        notified_not_answered(
+            "sensitive + failed lookup", service, result, "human_check_failed"
+        )
 
-    # 4. A message the customer sent is never mistaken for an agent reply.
-    mailbox, result = run_with({
-        f"to:{CUSTOMER}": [_row("cust-echo", "thread-CUST", f"Willie <{CUSTOMER}>")],
-        f"from:{CUSTOMER}": [_row("cust-1", "thread-CUST", f"Willie <{CUSTOMER}>")],
-    })
-    expect(
-        "the customer's own mail is not counted as an agent reply",
-        result["report"][CUSTOMER]["verdict"]["agent_replies_found"] == 0,
-        f"verdict={result['report'][CUSTOMER]['verdict']}",
-    )
+        # 5. A clean thread: notified AND answered with the fixed template.
+        service, result = _run_message(THREAT, thread={"messages": []}, dry_run=False)
+        expect(
+            "sensitive + clean thread: ops is notified",
+            len(service.ops_sends()) == 1,
+            f"ops sends={len(service.ops_sends())}",
+        )
+        customer = [_decoded(body) for body in service.customer_sends()]
+        expect(
+            "sensitive + clean thread: the customer gets the fixed template",
+            len(customer) == 1 and bot.SENSITIVE_ESCALATION_REPLY.splitlines()[2] in customer[0],
+            f"customer sends={customer!r}",
+        )
+        expect(
+            "sensitive + clean thread: reported as replied",
+            result.get("customer_replied") is True and result.get("escalated") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+        expect("sensitive + clean thread: Claude is not called", not CLAUDE_CALLS)
+        expect(
+            "the notification is a [SENSITIVE] one",
+            _decoded(service.ops_sends()[0]).count("Subject: [SENSITIVE] ") == 1,
+            f"ops={_decoded(service.ops_sends()[0])[:300]!r}",
+        )
 
-    # 5. It must run even with ALLOWED_SENDERS unset -- the safety switch that
-    #    normally stops everything must not stop the report.
-    mailbox, result = run_with(
-        {f"to:{CUSTOMER}": [], f"from:{CUSTOMER}": []}, allowed=None
-    )
-    expect(
-        "the report runs even with ALLOWED_SENDERS unset",
-        result.get("diagnostic") is True,
-        f"result keys={sorted(result)}",
-    )
+        # 6. DRY_RUN with an agent in the thread: no draft, no page, recorded.
+        service, result = _run_message(
+            THREAT, thread={"messages": [_outgoing("agent-1", stamped=False)]}, dry_run=True
+        )
+        expect(
+            "sensitive + agent in DRY_RUN: no draft and no page",
+            service.customer_reply() is None and not service.ops_sends(),
+            f"actions={[kind for kind, _ in service.actions]}",
+        )
+        expect(
+            "sensitive + agent in DRY_RUN: no draft_reply is returned",
+            "draft_reply" not in result
+            and (result.get("escalation") or {}).get("suppressed_by_dry_run") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
 
-    # 6. Several addresses in one go.
-    mailbox, result = run_with(
-        {
-            f"to:{CUSTOMER}": [_row("agent-1", "thread-A", "Amy <support@softorino.app>")],
-            "to:bisaillonfamily@gmail.com": [],
-            f"from:{CUSTOMER}": [],
-            "from:bisaillonfamily@gmail.com": [],
-        },
-        env_value=f"{CUSTOMER},bisaillonfamily@gmail.com",
-    )
-    expect(
-        "every address gets its own section",
-        sorted(result["report"]) == sorted([CUSTOMER, "bisaillonfamily@gmail.com"]),
-        f"report keys={sorted(result['report'])}",
-    )
+        # 7. The gates in front of it still win.
+        service, result = _run_message(
+            THREAT, subject="[AI Chat] New conversation", thread={"messages": []}, dry_run=False
+        )
+        expect(
+            "a threat inside service mail is still service mail",
+            result.get("skipped_reason") == "service" and not service.ops_sends(),
+            f"result={result!r}",
+        )
+        service, result = _run_message(
+            THREAT, sender=f"Softorino Support <{OWN_MAILBOX}>", dry_run=False
+        )
+        expect(
+            "a threat from our own mailbox is still skipped as self",
+            result.get("skipped_reason") == "self" and not service.ops_sends(),
+            f"result={result!r}",
+        )
+        service, result = _run_message(
+            "I am in court all day and will reply tomorrow.",
+            subject="Out of Office: Refund",
+            dry_run=False,
+        )
+        expect(
+            "an out-of-office mentioning court pages nobody and gets no reply",
+            not service.ops_sends() and not service.customer_sends(),
+            f"actions={[kind for kind, _ in service.actions]}",
+        )
+
+        # 8. Run level: a stale threat, live.
+        mailbox = FakeMailbox([("x1", "tx", 1000, THREAT)])
+        mailbox.store["x1"]["internalDate"] = _epoch_ms_hours_ago(13)
+        result = _run(mailbox, dry_run=False)
+        expect(
+            "run level: a stale threat pages ops and answers nobody",
+            len(_ops_sends(mailbox)) == 1
+            and len(mailbox.sent) == 1
+            and not mailbox.created_drafts,
+            f"ops={len(_ops_sends(mailbox))}, sent={len(mailbox.sent)}",
+        )
+        expect(
+            "run level: it is escalated, not counted as stale",
+            "id-AI_ESCALATED" in mailbox.labels_of("x1")
+            and "UNREAD" not in mailbox.labels_of("x1")
+            and result.get("skipped_stale") == 0,
+            f"labels={mailbox.labels_of('x1')}, stale={result.get('skipped_stale')}",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
 
     return failures
 
 
+# --- DRY_RUN on the sensitive path ------------------------------------------
+# DRY_RUN=true promises that nothing leaves the building and nothing in the
+# mailbox changes. The sensitive path has three side effects -- the ops page, the
+# customer reply and the labels -- and each one has its own dry_run switch, so
+# each one has to be proven separately. A draft is the one thing a dry run is
+# allowed to create: it is the reply, held back from sending.
+def check_sensitive_dry_run():
+    failures = []
+    expect = _expecter(failures)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    OPS = ["ops@softorino.app", "ops2@softorino.app"]
+
+    def kinds(service):
+        return [kind for kind, _ in service.actions]
+
+    def untouched(label, service, drafts):
+        expect(
+            f"{label}: no message is sent -- not to the customer, not to either ESCALATION_EMAIL",
+            "send" not in kinds(service),
+            f"actions={kinds(service)}",
+        )
+        expect(
+            f"{label}: no label is added or removed, UNREAD stays",
+            "modify" not in kinds(service),
+            f"actions={kinds(service)}",
+        )
+        expect(
+            f"{label}: {drafts} draft(s) created",
+            kinds(service).count("draft") == drafts,
+            f"actions={kinds(service)}",
+        )
+        expect(f"{label}: Claude is not called", not CLAUDE_CALLS, f"{len(CLAUDE_CALLS)} call(s)")
+
+    try:
+        with escalation_env(*OPS):
+            # 1. Clean thread: the reply is drafted, nothing else happens.
+            service, result = _run_message(THREAT, thread={"messages": []}, dry_run=True)
+            untouched("DRY_RUN sensitive, clean thread", service, drafts=1)
+            expect(
+                "DRY_RUN sensitive, clean thread: the draft is the fixed template",
+                bot.SENSITIVE_ESCALATION_REPLY.splitlines()[2] in (service.customer_reply() or ""),
+                f"reply={service.customer_reply()!r}",
+            )
+            expect(
+                "DRY_RUN sensitive, clean thread: the page is described for both addresses",
+                (result.get("escalation") or {}).get("suppressed_by_dry_run") is True
+                and (result.get("escalation") or {}).get("would_notify") == OPS,
+                f"escalation={result.get('escalation')}",
+            )
+
+            # 2-4. The three reasons the reply is withheld: no draft either.
+            service, result = _run_message(
+                THREAT, thread={"messages": [_outgoing("agent-1", stamped=False)]}, dry_run=True
+            )
+            untouched("DRY_RUN sensitive, agent in thread", service, drafts=0)
+            service, result = _run_message(
+                THREAT, thread={"messages": []}, agent_search_rows=[AGENT_MAIL], dry_run=True
+            )
+            untouched("DRY_RUN sensitive, agent by address", service, drafts=0)
+            service, result = _run_message(
+                THREAT, thread={"messages": []}, age_hours=30, dry_run=True
+            )
+            untouched("DRY_RUN sensitive, older than 12h", service, drafts=0)
+
+            # Control: the same scenario live does all three, so the checks above
+            # are not passing because nothing ever happens in this harness.
+            service, result = _run_message(THREAT, thread={"messages": []}, dry_run=False)
+            expect(
+                "control, live: one page to each address, one reply, one label change",
+                len(service.ops_sends()) == 1
+                and _decoded(service.ops_sends()[0]).count("ops@softorino.app") >= 1
+                and "ops2@softorino.app" in _decoded(service.ops_sends()[0])
+                and len(service.customer_sends()) == 1
+                and "modify" in kinds(service),
+                f"actions={kinds(service)}",
+            )
+
+            # Run level, through process_unread_emails() with DRY_RUN=true.
+            mailbox = FakeMailbox([("x1", "tx", 1000, THREAT)])
+            before = mailbox.labels_of("x1")
+            result = _run(mailbox, dry_run=True)
+            expect(
+                "DRY_RUN sensitive, run level: nothing is sent at all",
+                mailbox.sent == [],
+                f"sent={len(mailbox.sent)}",
+            )
+            expect(
+                "DRY_RUN sensitive, run level: the mailbox is unchanged",
+                mailbox.modifies == [] and mailbox.labels_of("x1") == before,
+                f"modifies={mailbox.modifies}, labels={mailbox.labels_of('x1')}",
+            )
+            expect(
+                "DRY_RUN sensitive, run level: the suppressed page is recorded",
+                len(result.get("suppressed_ops_notifications") or []) == 1
+                and result["suppressed_ops_notifications"][0]["would_notify"] == OPS,
+                f"suppressed={result.get('suppressed_ops_notifications')}",
+            )
+
+            mailbox = FakeMailbox([("x2", "tx2", 1000, THREAT)])
+            mailbox.agent_search_rows = [AGENT_MAIL]
+            before = mailbox.labels_of("x2")
+            _run(mailbox, dry_run=True)
+            expect(
+                "DRY_RUN sensitive + agent, run level: no send, no draft, no label change",
+                mailbox.sent == []
+                and mailbox.created_drafts == []
+                and mailbox.modifies == []
+                and mailbox.labels_of("x2") == before,
+                f"sent={len(mailbox.sent)}, drafts={len(mailbox.created_drafts)}, "
+                f"modifies={mailbox.modifies}",
+            )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
+# --- the bot's own ops notifications are not agents --------------------------
+# escalate_email() writes "[ESCALATION] <subject> — <customer>" from our own
+# mailbox to ESCALATION_EMAIL. Read as an agent message, every address on that
+# list was silenced for good the first time it was paged.
+def check_ops_notification_subjects():
+    failures = []
+    expect = _expecter(failures)
+
+    def agent(subject, stamped=False):
+        headers = [{"name": "Subject", "value": subject}]
+        if stamped:
+            headers.append({"name": bot.BOT_HEADER_NAME, "value": bot.BOT_HEADER_VALUE})
+        return bot.is_agent_message(headers)
+
+    for subject in [
+        "[ESCALATION] Re: Crash on launch — customer@example.com",
+        "Re: [ESCALATION] Re: Crash on launch — customer@example.com",
+        "RE: Fwd: [escalation] Refund — customer@example.com",
+        "[HIGH PRIORITY] This is a scam — customer@example.com",
+        "[SENSITIVE] I'll sue you — customer@example.com",
+    ]:
+        expect(f"not an agent: {subject!r}", agent(subject) is False)
+    expect("an ordinary unstamped reply is still an agent", agent("Re: Crash on launch") is True)
+    expect(
+        "the prefix has to lead: a mention later on does not count",
+        agent("Re: why did I get an [ESCALATION] notice?") is True,
+    )
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+    try:
+        ops_page = {
+            "id": "ops-1",
+            "subject": "[ESCALATION] Re: Refund — ops@softorino.app",
+            "stamped": False,
+        }
+        service, result = _run_message(
+            "My app will not start",
+            sender="Ops <ops@softorino.app>",
+            thread={"messages": []},
+            agent_search_rows=[ops_page],
+        )
+        expect(
+            "an ESCALATION_EMAIL address that was paged is still answered",
+            result.get("processed") is True and service.customer_reply() is not None,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+        service, result = _run_message(
+            "WALTR PRO will not start", subject="[HIGH PRIORITY] app broken", thread={"messages": []}
+        )
+        expect(
+            "a customer subject starting [HIGH PRIORITY] is not dropped as service mail",
+            result.get("processed") is True,
+            f"result={ {k: v for k, v in result.items() if k != 'escalation'} }",
+        )
+
+        # The send path: subject prefix and bot stamp, as Gmail will see them.
+        service, _ = _run_message(
+            "Just refund me, I don't want troubleshooting", thread={"messages": []}, dry_run=False
+        )
+        ops = _decoded(service.ops_sends()[0]) if service.ops_sends() else ""
+        expect(
+            "the ops notification subject starts with [ESCALATION]",
+            "Subject: [ESCALATION] Refund" in ops,
+            f"ops={ops[:300]!r}",
+        )
+        expect(
+            "the ops notification is stamped X-Softorino-Bot",
+            f"{bot.BOT_HEADER_NAME}: {bot.BOT_HEADER_VALUE}" in ops,
+            f"ops={ops[:300]!r}",
+        )
+        expect(
+            "every priority prefix is recognised by is_agent_message()",
+            all(
+                bot.is_ops_notification_subject(f"{prefix} x")
+                for prefix in bot.OPS_NOTIFICATION_PREFIXES.values()
+            ),
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
+# --- a failed agent lookup is retried, not buried ---------------------------
+def check_lookup_failure_retry():
+    failures = []
+    expect = _expecter(failures)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+
+    class BrokenSearch(FakeGmailService):
+        def list(self, userId=None, q=None, maxResults=None):
+            raise RuntimeError("Gmail is having a moment")
+
+    try:
+        service, result = _run_message(
+            "My app will not start", service=BrokenSearch({"messages": []}), dry_run=False
+        )
+        expect(
+            "a failed lookup is labelled AI_CHECK_FAILED",
+            service.added_labels() == [LABEL_IDS["check_failed"]],
+            f"added={service.added_labels()}",
+        )
+        expect(
+            "a failed lookup keeps UNREAD",
+            "UNREAD" not in service.removed_labels(),
+            f"removed={service.removed_labels()}",
+        )
+        expect(
+            "a failed lookup is reported with the check_failed label key",
+            result.get("label_key") == "check_failed"
+            and result.get("skipped_reason") == "human_check_failed"
+            and "remove_unread" not in result,
+            f"result={result!r}",
+        )
+
+        # Run level: the next run picks it up again and answers it.
+        mailbox = FakeMailbox([("f1", "tf", 1000, "Crash on launch")])
+        mailbox.agent_search_raises = True
+        result = _run(mailbox, dry_run=False)
+        expect(
+            "run level: AI_CHECK_FAILED lands and UNREAD stays",
+            "id-AI_CHECK_FAILED" in mailbox.labels_of("f1")
+            and "UNREAD" in mailbox.labels_of("f1")
+            and result.get("human_check_failed") == 1
+            and not mailbox.sent,
+            f"labels={mailbox.labels_of('f1')}, result={ {k: v for k, v in result.items() if k != 'results'} }",
+        )
+        mailbox.agent_search_raises = False
+        result = _run(mailbox, dry_run=False)
+        expect(
+            "run level: the retry answers it and drops AI_CHECK_FAILED",
+            "id-AI_REPLIED" in mailbox.labels_of("f1")
+            and "id-AI_CHECK_FAILED" not in mailbox.labels_of("f1")
+            and "UNREAD" not in mailbox.labels_of("f1")
+            and len(mailbox.sent) == 1,
+            f"labels={mailbox.labels_of('f1')}, sent={len(mailbox.sent)}",
+        )
+
+        # A failure that never clears ends at the age gate, not in a loop.
+        mailbox = FakeMailbox([("f2", "tf2", 1000, "Crash on launch")])
+        mailbox.agent_search_raises = True
+        _run(mailbox, dry_run=False)
+        mailbox.store["f2"]["internalDate"] = _epoch_ms_hours_ago(13)
+        result = _run(mailbox, dry_run=False)
+        expect(
+            "a persistent failure is settled as stale after 12 hours",
+            result.get("skipped_stale") == 1
+            and "id-AI_SKIPPED_STALE" in mailbox.labels_of("f2")
+            and "id-AI_CHECK_FAILED" not in mailbox.labels_of("f2"),
+            f"labels={mailbox.labels_of('f2')}",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
+# --- a notification nobody receives is reported -----------------------------
+def check_ops_notifications_skipped():
+    failures = []
+    expect = _expecter(failures)
+    REFUND = "Just refund me, I don't want troubleshooting"
+
+    def run(mailbox, dry_run, first, second=None):
+        CLAUDE_CALLS.clear()
+        # Inside _run_environment, which sets ESCALATION_EMAIL_1 itself.
+        with _run_environment(mailbox), dry_run_env(dry_run), escalation_env(first, second):
+            return _quiet(bot.process_unread_emails)
+
+    mailbox = FakeMailbox([("e1", "te", 1000, REFUND), ("n1", "tn", 1000, "Crash on launch")])
+    result = run(mailbox, dry_run=False, first=None)
+    entries = result.get("ops_notifications_skipped_messages") or []
+    expect(
+        "no ESCALATION_EMAIL: ops_notifications_skipped counts it",
+        result.get("ops_notifications_skipped") == 1,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+    expect(
+        "no ESCALATION_EMAIL: the message is listed with the reason",
+        len(entries) == 1
+        and entries[0]["message_id"] == "e1"
+        and entries[0]["why"] == "no_recipients"
+        and entries[0]["reason"] == "Refund Request (Customer Refuses Help)",
+        f"entries={entries}",
+    )
+    expect(
+        "no ESCALATION_EMAIL: the customer is still answered",
+        len(mailbox.sent) == 2 and not _ops_sends(mailbox),
+        f"sent={len(mailbox.sent)}, ops={len(_ops_sends(mailbox))}",
+    )
+
+    result = run(FakeMailbox([("e1", "te", 1000, REFUND)]), dry_run=True, first=None)
+    expect(
+        "no ESCALATION_EMAIL in DRY_RUN is counted too",
+        result.get("ops_notifications_skipped") == 1
+        and result.get("suppressed_ops_notifications") == [],
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+
+    result = run(FakeMailbox([("e1", "te", 1000, REFUND)]), dry_run=False, first=None,
+                 second="ops2@softorino.app")
+    expect(
+        "ESCALATION_EMAIL_2 alone is enough",
+        result.get("ops_notifications_skipped") == 0,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+
+    mailbox = FakeMailbox([("e1", "te", 1000, REFUND)])
+    result = run(mailbox, dry_run=False, first="ops@softorino.app")
+    expect(
+        "configured and sent: nothing is counted",
+        result.get("ops_notifications_skipped") == 0
+        and result.get("ops_notifications_skipped_messages") == []
+        and len(_ops_sends(mailbox)) == 1,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+
+    mailbox = FakeMailbox([("e1", "te", 1000, REFUND)])
+    mailbox.ops_send_raises = True
+    result = run(mailbox, dry_run=False, first="ops@softorino.app")
+    entries = result.get("ops_notifications_skipped_messages") or []
+    expect(
+        "a failed send is counted as well",
+        result.get("ops_notifications_skipped") == 1
+        and entries
+        and entries[0]["why"].startswith("send_failed"),
+        f"entries={entries}",
+    )
+
+    mailbox = FakeMailbox([("x1", "tx", 1000, THREAT)])
+    result = run(mailbox, dry_run=False, first=None)
+    expect(
+        "a sensitive escalation with no ESCALATION_EMAIL is counted",
+        result.get("ops_notifications_skipped") == 1,
+        f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+    )
+    return failures
+
+
+# --- knowledge base routing reads the subject -------------------------------
+def check_kb_routing_by_subject():
+    failures = []
+    expect = _expecter(failures)
+
+    def files(body, subject=""):
+        return bot.relevant_kb_files(body, subject)
+
+    expect(
+        "product only in the subject: beamer.md is picked",
+        "beamer.md" in files("It keeps crashing on start.", "Problems with Beamer"),
+        f"files={files('It keeps crashing on start.', 'Problems with Beamer')}",
+    )
+    expect(
+        "lowercase product in the subject: waltr_pro.md is picked",
+        "waltr_pro.md" in files("doesn't see my phone", "waltr pro not working"),
+    )
+    expect(
+        "Re:/Fwd: in front of the subject does not hide it",
+        "beamer.md" in files("still broken", "RE: Fwd: Re: Beamer"),
+    )
+    expect(
+        "a product named only in the body still routes",
+        "beamer.md" in files("Beamer will not cast", "Help"),
+    )
+    expect(
+        "no product anywhere: the catalogue fallback",
+        "Softorino_Products.md" in files("hello?", "Question"),
+        f"files={files('hello?', 'Question')}",
+    )
+    expect(
+        "subject and body do not run together into a fake word",
+        "beamer.md" not in files("mer is the word", "Bea"),
+    )
+
+    # End to end: process_single_message hands the subject through.
+    original_fetch = bot.fetch_kb_file
+    bot.fetch_kb_file = lambda filename: f"KB {filename}"
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    try:
+        _service, result = _run_message(
+            "It keeps crashing on start.", subject="Problems with Beamer", thread={"messages": []}
+        )
+        expect(
+            "end to end: a subject-only product reaches the KB files used",
+            "beamer.md" in (result.get("knowledge_base_files") or []),
+            f"files={result.get('knowledge_base_files')}",
+        )
+        prompt = CLAUDE_CALLS[0]["messages"][0]["content"] if CLAUDE_CALLS else ""
+        system = CLAUDE_CALLS[0].get("system", "") if CLAUDE_CALLS else ""
+        expect(
+            "end to end: the Beamer KB text is in what Claude sees",
+            "KB beamer.md" in f"{system}{prompt}",
+        )
+    finally:
+        bot.fetch_kb_file = original_fetch
+
+    return failures
+
+
+# --- mailing lists and marketing --------------------------------------------
+UNSUBSCRIBE = [{"name": "List-Unsubscribe", "value": "<mailto:unsub@promo.example>"}]
+
+
+def check_bulk_mail():
+    failures = []
+    expect = _expecter(failures)
+
+    original_kb = bot.build_knowledge_base
+    bot.build_knowledge_base = lambda content, subject="": ("KB TEXT", ["tone_of_voice.md"])
+    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+    os.environ["ESCALATION_EMAIL_1"] = "ops@softorino.app"
+    try:
+        service, result = _run_message(
+            "Grow your SEO 10x this week!",
+            subject="Quick question",
+            thread={"messages": []},
+            extra_headers=UNSUBSCRIBE,
+            dry_run=False,
+        )
+        expect(
+            "List-Unsubscribe: skipped as bulk",
+            result.get("skipped_reason") == "bulk" and result.get("processed") is False,
+            f"result={result!r}",
+        )
+        expect("List-Unsubscribe: Claude is not called", not CLAUDE_CALLS)
+        expect(
+            "List-Unsubscribe: nothing is sent",
+            not service.customer_sends() and not service.ops_sends(),
+        )
+        expect(
+            "List-Unsubscribe: labelled AI_SKIPPED_SERVICE and read",
+            service.added_labels() == [LABEL_IDS["skipped_service"]]
+            and "UNREAD" in service.removed_labels(),
+            f"added={service.added_labels()}, removed={service.removed_labels()}",
+        )
+        service, result = _run_message(
+            "Your lawyer will love this offer",
+            thread={"messages": []},
+            extra_headers=UNSUBSCRIBE,
+            dry_run=False,
+        )
+        expect(
+            "a bulk mail with a sensitive word does not page ops",
+            result.get("skipped_reason") == "bulk" and not service.ops_sends(),
+            f"result={result!r}",
+        )
+        expect(
+            "the header name is matched case-insensitively",
+            bot.is_bulk_mail([{"name": "list-unsubscribe", "value": "<https://x>"}])
+            and not bot.is_bulk_mail([{"name": "Subject", "value": "unsubscribe me"}]),
+        )
+
+        mailbox = FakeMailbox([
+            ("b1", "tb", 1000, "Black Friday deals"),
+            ("ok1", "tok", 1000, "Crash on launch"),
+        ])
+        mailbox.extra_headers["b1"] = UNSUBSCRIBE
+        result = _run(mailbox)
+        expect(
+            "run level: skipped_bulk counts it and the real mail is answered",
+            result.get("skipped_bulk") == 1
+            and result.get("skipped_service_mail") == 0
+            and len(mailbox.created_drafts) == 1
+            and len(CLAUDE_CALLS) == 1,
+            f"result={ {k: v for k, v in result.items() if k != 'results'} }",
+        )
+    finally:
+        bot.build_knowledge_base = original_kb
+
+    return failures
+
+
+# --- removed and renamed ----------------------------------------------------
+def check_removed_and_renamed():
+    failures = []
+    expect = _expecter(failures)
+
+    expect(
+        "MAX_THREADS_PER_RUN replaces MAX_EMAILS_PER_RUN",
+        getattr(bot, "MAX_THREADS_PER_RUN", None) == 10 and not hasattr(bot, "MAX_EMAILS_PER_RUN"),
+    )
+    expect(
+        "the scan budget still derives from the thread limit",
+        bot.MAX_MESSAGES_SCANNED_PER_RUN == bot.MAX_THREADS_PER_RUN * 5,
+    )
+    expect(
+        "diagnostic mode is gone",
+        not any(
+            hasattr(bot, name)
+            for name in ("run_mailbox_diagnostic", "diagnostic_addresses", "DIAGNOSTIC_ADDRESSES_ENV")
+        ),
+    )
+    expect(
+        "the one-off diagnostic script is gone",
+        not (REPO_ROOT / "scripts" / "diagnose_agent_replies.py").exists(),
+    )
+
+    # A leftover variable in Vercel must not stop the bot answering mail.
+    mailbox = FakeMailbox([("m1", "t1", 1000, "Crash on launch")])
+    previous = os.environ.get("DIAGNOSTIC_ADDRESSES")
+    os.environ["DIAGNOSTIC_ADDRESSES"] = "someone@example.com"
+    try:
+        result = _run(mailbox)
+    finally:
+        if previous is None:
+            os.environ.pop("DIAGNOSTIC_ADDRESSES", None)
+        else:
+            os.environ["DIAGNOSTIC_ADDRESSES"] = previous
+    expect(
+        "a stale DIAGNOSTIC_ADDRESSES no longer short-circuits the run",
+        result.get("processed_count") == 1 and len(mailbox.created_drafts) == 1,
+        f"result keys={sorted(result)}",
+    )
+    return failures
+
+
+class _CountingStdout:
+    """Passes output through and counts the ok/FAIL lines, so the total at the
+    bottom cannot drift from what actually ran."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.checks = 0
+
+    def write(self, text):
+        self.checks += sum(
+            1 for line in text.splitlines() if line.startswith(("  ok ", "  FAIL "))
+        )
+        return self.stream.write(text)
+
+    def flush(self):
+        self.stream.flush()
+
+
 def main():
+    counter = _CountingStdout(sys.stdout)
+    sys.stdout = counter
+    try:
+        return _run_all(counter)
+    finally:
+        sys.stdout = counter.stream
+
+
+def _run_all(counter):
     print("Escalation triggers:")
     failures = check_escalations()
     print("\nEscalation categories:")
@@ -2538,9 +3096,6 @@ def main():
     print("\nHuman agents and service mail:")
     failures += check_human_and_service_gates()
 
-    print("\nDiagnostic mode (temporary):")
-    failures += check_diagnostic_mode()
-
     print("\nSubject normalisation:")
     failures += check_subject_normalisation()
 
@@ -2562,26 +3117,31 @@ def main():
     print("\nQuote stripping:")
     failures += check_quote_stripping()
 
-    total = (
-        len(ESCALATION_CASES)
-        + len(CATEGORY_CASES)
-        + len(DEDUP_CASES)
-        + 2  # degenerate dedup inputs
-        + len(SENSITIVE_CASES)
-        + 12  # sender allow-list
-        + 18  # end to end
-        + 15  # thread grouping
-        + 2   # outgoing stamp
-        + 33  # human / service gates
-        + 35  # message age
-        + 18  # diagnostic mode
-        + 23  # agent lookup
-        + 19  # dry run
-        + len(SERVICE_SUBJECT_CASES)
-        + 2   # subject normalisation, end to end
-        + 4   # unread total
-        + 5  # quote stripping
-    )
+    print("\nSensitive content ahead of the age and agent gates:")
+    failures += check_sensitive_gate()
+
+    print("\nSensitive content in DRY_RUN:")
+    failures += check_sensitive_dry_run()
+
+    print("\nOps notifications are not agents:")
+    failures += check_ops_notification_subjects()
+
+    print("\nFailed agent lookup (AI_CHECK_FAILED):")
+    failures += check_lookup_failure_retry()
+
+    print("\nOps notifications that never left:")
+    failures += check_ops_notifications_skipped()
+
+    print("\nKnowledge base routing by subject:")
+    failures += check_kb_routing_by_subject()
+
+    print("\nMailing lists (List-Unsubscribe):")
+    failures += check_bulk_mail()
+
+    print("\nRemoved and renamed:")
+    failures += check_removed_and_renamed()
+
+    total = counter.checks
     if failures:
         print(f"\n{len(failures)} of {total} checks failed.")
         return 1
