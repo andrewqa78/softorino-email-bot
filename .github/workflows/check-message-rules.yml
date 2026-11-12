@@ -8,11 +8,15 @@ on:
     paths:
       - "api/process_email.py"
       - "scripts/check_message_rules.py"
+      - "api/groove_probe.py"
+      - "scripts/check_groove_probe.py"
       - ".github/workflows/check-message-rules.yml"
   pull_request:
     paths:
       - "api/process_email.py"
       - "scripts/check_message_rules.py"
+      - "api/groove_probe.py"
+      - "scripts/check_groove_probe.py"
   workflow_dispatch:
 
 jobs:
@@ -29,3 +33,7 @@ jobs:
       # imports and only exercises pure rule functions.
       - name: Escalation triggers and quote stripping
         run: python scripts/check_message_rules.py
+
+      # Stdlib only, mocked Groove responses: no token, no network.
+      - name: Groove probe leaks nothing and only reads
+        run: python scripts/check_groove_probe.py

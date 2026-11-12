@@ -1,0 +1,53 @@
+name: Groove probe
+
+# Manual only. Calls api/groove_probe.py, which reads Groove with GET requests
+# and prints the *shape* of the data: field names, types, enum values, counts.
+# This repo is public and so is this log, so the function never returns names,
+# emails, subjects or message text -- do not add steps that print more.
+on:
+  workflow_dispatch:
+    inputs:
+      customer_email:
+        description: "Optional. Show only author kind and time for this customer's tickets. Workflow inputs are visible on public runs, so use a test address, not a real customer."
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Call the probe
+        env:
+          # Never interpolated into the command line, so it cannot reach the log
+          # through a traced command. No -v, no printing the request.
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          CUSTOMER_EMAIL: ${{ inputs.customer_email }}
+        run: |
+          set +e
+          if [ -n "$CUSTOMER_EMAIL" ]; then
+            # Keeps the address out of any later log line in this job.
+            echo "::add-mask::$CUSTOMER_EMAIL"
+            extra=(--get --data-urlencode "customer_email=$CUSTOMER_EMAIL")
+          else
+            extra=()
+          fi
+          # --fail-with-body: non-zero exit on 4xx/5xx, but still print the body,
+          # so a failed probe is red in the history.
+          response=$(curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --max-time 20 \
+            --header "Authorization: Bearer $CRON_SECRET" \
+            "${extra[@]}" \
+            https://softorino-email-bot-green.vercel.app/api/groove_probe)
+          status=$?
+          set -e
+
+          echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+
+          if [ $status -ne 0 ]; then
+            echo "::error::Groove probe failed (curl exit $status)"
+            exit $status
+          fi
